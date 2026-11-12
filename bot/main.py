@@ -1479,7 +1479,7 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
     rows = []
     for c in list(state.get("channels", [])):
         await edit_msg(progress, f"⏳ <b>بررسی پوشش {hours} ساعت اخیر</b>\n📡 خواندن کانال {esc(c['key'])}…")
-        try:
+        async def read_channel():
             peer = await user.get_entity(c["peer"])
             async for m in user.iter_messages(peer, limit=600):
                 if m.date and m.date < since:
@@ -1487,9 +1487,12 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
                 p = parse_post(m)
                 if p:
                     rows.append((ref_of(c["key"], m.id), m, p))
+        try:
+            trace(f"audit: reading {c['key']}")
+            await asyncio.wait_for(read_channel(), 180)
         except Exception as e:
             await notify(f"⚠️ کانال {esc(c['key'])} خوانده نشد: {type(e).__name__}")
-    log(f"audit: {len(rows)} IPA posts in the last {hours}h")
+    trace(f"audit: {len(rows)} IPA posts in the last {hours}h")
     out = []
     for i, (ref, m, p) in enumerate(rows, 1):
         state["audit_progress"] = {"t": now_iso(), "i": i, "n": len(rows)}
@@ -1530,7 +1533,7 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
                         "bot": it.get("status"), "code": it.get("code"), "reason": it.get("reason"), "dm": True})
     state["audit"] = {"t": now_iso(), "hours": hours, "rows": out}
     state.pop("audit_progress", None)
-    log(f"audit done: {len(out)} rows, missed {sum(1 for r in out if r.get('missed'))}")
+    trace(f"audit done: {len(out)} rows, missed {sum(1 for r in out if r.get('missed'))}")
     mark()
     save_state()
     if notify_result:
@@ -1540,6 +1543,15 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
         else:
             await notify(audit_summary() + "\n\n" + text, buttons=rows_b)
     return out
+
+
+def trace(msg):
+    """Short persisted trace (encrypted state) so a stalled step is visible from outside the runner."""
+    log(msg)
+    tl = state.setdefault("trace", [])
+    tl.append(f"{now_iso()} {msg[:160]}")
+    state["trace"] = tl[-60:]
+    mark()
 
 
 def audit_summary():
@@ -2079,6 +2091,7 @@ async def main():
             t0 = time.time()
             while kind in ("publish", "discard") and (ref in inflight or (state["items"].get(ref) or {}).get("status") in (None, "queued")) and time.time() - t0 < 45 * 60:
                 await asyncio.sleep(10)  # a test item queued in the same run must finish first
+            trace(f"test action {a} start (batches={len(batches)}, inflight={len(inflight)})")
             try:
                 if kind in ("publish", "discard"):
                     prog = await progress_msg(f"⏳ (آزمایشی) {kind}: {esc(ref)}…")
@@ -2088,7 +2101,7 @@ async def main():
                     prog = await progress_msg(f"⏳ بررسی پست‌های {day_label(day)}…")
                     await scan_day(day, f"چک آپدیت‌های {day_label(day)}", progress=prog)
                     t1 = time.time()
-                    log(f"test scan {ref}: waiting for {len(batches)} batch(es)")
+                    trace(f"test scan {ref}: waiting for {len(batches)} batch(es) {[b['label'] for b in batches.values()]}")
                     while batches and time.time() - t1 < 3 * 3600:
                         await asyncio.sleep(10)
                     st = "scanned"
@@ -2098,9 +2111,9 @@ async def main():
                     st = "audited"
                 else:
                     st = None
-                log(f"test action {kind} -> {st}")
+                trace(f"test action {kind} -> {st}")
             except Exception as e:
-                log(f"test action {kind} failed: {type(e).__name__}")
+                trace(f"test action {kind} failed: {type(e).__name__}: {str(e)[:100]}")
     if TEST_ACTIONS:
         tasks.append(asyncio.create_task(run_test_actions()))
     if not state.get("hello_v4"):
