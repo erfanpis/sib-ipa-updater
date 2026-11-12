@@ -2097,7 +2097,7 @@ async def main():
                     prog = await progress_msg(f"⏳ (آزمایشی) {kind}: {esc(ref)}…")
                     st = await queue_action(kind, ref, prog)
                 elif kind == "scan":
-                    day = dt.datetime.now(TEHRAN).date() - dt.timedelta(days=1 if ref == "yesterday" else 0)
+                    day = parse_day(ref) or (dt.datetime.now(TEHRAN).date() - dt.timedelta(days=1 if ref == "yesterday" else 0))
                     prog = await progress_msg(f"⏳ بررسی پست‌های {day_label(day)}…")
                     await scan_day(day, f"چک آپدیت‌های {day_label(day)}", progress=prog)
                     t1 = time.time()
