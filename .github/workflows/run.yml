@@ -1,6 +1,9 @@
 # SibStar IPA auto-updater — 24/7 on GitHub Actions (same pattern as linkyar):
-# each run lives ~4h45m, then requests the next run; cron every 30 min is the backup
-# (a queued cron run waits behind the running one via the concurrency group).
+# each run lives ~4h50m. Hand-off without a gap: ~10 min before the end the running bot's step requests the
+# next run; that successor installs everything, then waits (gate step) until the old run has finished and its
+# final state is pushed, and starts immediately. Only the OLDEST live run may run the bot; a third live run exits.
+# If the running bot's heartbeat (state branch commit time) is stale for 15 min, the successor cancels it and
+# takes over. Cron every 30 min is the backup.
 # State is kept only ENCRYPTED (state.enc on the `state` branch); bot output is not printed.
 name: updater
 
@@ -27,14 +30,10 @@ permissions:
   contents: write
   actions: write
 
-concurrency:
-  group: sib-ipa-updater
-  cancel-in-progress: false
-
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 330
+    timeout-minutes: 355
     steps:
       - uses: actions/checkout@v4
         with:
@@ -48,7 +47,31 @@ jobs:
       - name: Install
         run: pip install -q -r requirements.txt
 
+      - name: Single instance / hand-off gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          R="$GITHUB_REPOSITORY"; ME="${{ github.run_id }}"; deadline=$(( $(date +%s) + 2400 ))
+          while :; do
+            live=$(gh run list -R "$R" -w run.yml -L 30 --json databaseId,status,createdAt \
+              -q '[.[] | select(.status != "completed")] | sort_by(.createdAt) | .[] | "\(.databaseId) \(.createdAt)"' 2>/dev/null) || { sleep 10; continue; }
+            pos=$(echo "$live" | awk -v me="$ME" '$1==me{print NR}')
+            [ -z "$pos" ] && pos=1
+            if [ "$pos" = "1" ]; then echo "go=1" >> "$GITHUB_OUTPUT"; echo "starting bot"; exit 0; fi
+            if [ "$pos" -gt 2 ]; then echo "a successor is already waiting; exiting"; echo "go=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+            older=$(echo "$live" | head -1 | cut -d' ' -f1); ocreated=$(echo "$live" | head -1 | cut -d' ' -f2)
+            hb=$(gh api "repos/$R/branches/state" -q .commit.commit.committer.date 2>/dev/null || true)
+            now=$(date +%s); hbage=$(( now - $(date -d "${hb:-now}" +%s) )); oage=$(( now - $(date -d "$ocreated" +%s) ))
+            if [ "$oage" -gt 1500 ] && [ "$hbage" -gt 900 ]; then
+              echo "running bot looks dead (heartbeat ${hbage}s old); cancelling it"; gh run cancel "$older" -R "$R" || true; sleep 20
+            fi
+            if [ "$(date +%s)" -gt "$deadline" ]; then echo "go=0" >> "$GITHUB_OUTPUT"; exit 0; fi
+            sleep 8
+          done
+
       - name: State branch (encrypted)
+        if: steps.gate.outputs.go == '1'
         env:
           STATE_KEY: ${{ secrets.STATE_KEY }}
         run: |
@@ -59,7 +82,8 @@ jobs:
           openssl enc -d -aes-256-cbc -pbkdf2 -iter 200000 -in state/state.enc -out state/state.json -pass env:STATE_KEY
           echo "state restored"
 
-      - name: Run (about 4h45m)
+      - name: Run (about 4h50m)
+        if: steps.gate.outputs.go == '1'
         env:
           TG_API_ID: ${{ secrets.TG_API_ID }}
           TG_API_HASH: ${{ secrets.TG_API_HASH }}
@@ -72,18 +96,26 @@ jobs:
           TEST_REFS: ${{ github.event.inputs.test_refs }}
           TEST_MODE: ${{ github.event.inputs.test_mode }}
           TEST_ACTIONS: ${{ github.event.inputs.test_actions }}
+          RESPAWN_TOKEN: ${{ github.token }}
+          NO_RESPAWN: ${{ vars.NO_RESPAWN }}
           STATE_DIR: state
           PYTHONUNBUFFERED: "1"
         run: |
+          # successor requested ~10 min before the end so it is installed and waiting at the gate
+          if [ "$NO_RESPAWN" != "1" ]; then
+            ( sleep 15600; GH_TOKEN="$RESPAWN_TOKEN" gh workflow run run.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" >/dev/null 2>&1 ) &
+          fi
           # public repo: bot output stays off the public Actions log (status goes to the admin bot)
-          timeout --signal=SIGINT 17700 python bot/main.py > "$RUNNER_TEMP/bot.log" 2>&1 || code=$?
+          env -u RESPAWN_TOKEN timeout --signal=SIGINT 17400 python bot/main.py > "$RUNNER_TEMP/bot.log" 2>&1 || code=$?
           echo "bot exited code=${code:-0} log_lines=$(wc -l < "$RUNNER_TEMP/bot.log")"
           if [ "${code:-0}" = "124" ] || [ "${code:-0}" = "0" ]; then exit 0; fi
           exit "${code:-1}"
 
-      - name: Respawn next run
-        if: always() && vars.NO_RESPAWN != '1'
+      - name: Respawn next run (only if no successor is live)
+        if: always() && steps.gate.outputs.go == '1' && vars.NO_RESPAWN != '1'
         env:
           GH_TOKEN: ${{ secrets.RESPAWN_PAT || github.token }}
         run: |
+          n=$(gh run list -R "$GITHUB_REPOSITORY" -w run.yml -L 30 --json databaseId,status -q "[.[] | select(.status != \"completed\" and .databaseId != ${{ github.run_id }})] | length" 2>/dev/null || echo 0)
+          if [ "${n:-0}" -gt 0 ]; then echo "successor already live"; exit 0; fi
           gh workflow run run.yml --repo "$GITHUB_REPOSITORY" --ref "${GITHUB_REF_NAME}" && echo "respawn requested" || echo "respawn failed (cron will restart)"
