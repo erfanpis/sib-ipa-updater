@@ -47,7 +47,7 @@ STATE_KEY = os.environ.get("STATE_KEY", "")  # state is pushed ONLY encrypted (p
 # v3: the admin's mode button is the control; the server's SIBSTAR_AUTO_IPA_ALLOW_PUBLISH is the master kill switch.
 FINAL_STATUSES = ("draft_ok", "published", "skipped", "rejected", "duplicate", "discarded", "needs_confirm")
 SITE = os.environ.get("SITE_URL", "https://beta.sibstars.ir").rstrip("/")
-TEST_ACTIONS = [a.strip() for a in os.environ.get("TEST_ACTIONS", "").split(",") if ":" in a]
+TEST_ACTIONS = [(a.strip() if ":" in a else a.strip() + ":") for a in os.environ.get("TEST_ACTIONS", "").split(",") if a.strip()]
 # one-off test run (workflow_dispatch inputs): refs like "blatants/13480"; TEST_MODE=publish is explicit approval
 TEST_REFS = [r.strip() if "/" in r else f"{DEFAULT_CHANNEL}/{r.strip()}" for r in os.environ.get("TEST_REFS", os.environ.get("TEST_MESSAGE_ID", "")).split(",") if r.strip() and r.strip() != "0"]
 TEST_MODE = "publish" if os.environ.get("TEST_MODE") == "publish" else "draft"
