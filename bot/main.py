@@ -5,6 +5,7 @@ asks SibStar (/api/internal/auto-ipa-update) to stage-import it for the matching
 draft (default) or publish. Admin bot (@erfanitt only) reports and controls everything.
 """
 import asyncio
+import hashlib
 import datetime as dt
 import html
 import json
@@ -35,6 +36,9 @@ RUN_SECONDS = int(os.environ.get("RUN_SECONDS", str(5 * 3600 - 15 * 60)))
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 STATE_PUSH = os.environ.get("STATE_PUSH", "1") == "1"
 STATE_KEY = os.environ.get("STATE_KEY", "")  # state is pushed ONLY encrypted (public repo)
+# Publishing is LOCKED unless the repo variable PUBLISH_UNLOCKED=1 is set (Erfan's explicit approval).
+PUBLISH_UNLOCKED = os.environ.get("PUBLISH_UNLOCKED", "0") == "1"
+FINAL_STATUSES = ("draft_ok", "published", "skipped", "rejected", "duplicate")
 TEST_MESSAGE_ID = int(os.environ.get("TEST_MESSAGE_ID", "0") or 0)
 PROXY = None
 if os.environ.get("BOX_PROXY"):
@@ -80,6 +84,9 @@ def load_state():
         state.setdefault(k, json.loads(json.dumps(v)))
     if ADMIN_ID_ENV and not state.get("admin_id"):
         state["admin_id"] = ADMIN_ID_ENV
+    if not PUBLISH_UNLOCKED and state.get("mode") != "draft":
+        state["mode"] = "draft"
+        event("mode forced to draft (publish locked)")
 
 
 def mark():
@@ -113,7 +120,6 @@ def save_state(push=True):
             global _pushed_hash
             if not STATE_KEY:
                 raise RuntimeError("no STATE_KEY")
-            import hashlib
             h = hashlib.sha256(open(STATE_FILE, "rb").read()).hexdigest()
             if h == _pushed_hash:
                 return
@@ -299,7 +305,7 @@ def item_buttons(it):
         return [[Button.inline("🔁 تلاش دوباره", f"retry:{mid}".encode())]]
     if st == "skipped" and it.get("code") in ("same_version", "older_version"):
         return [[Button.inline("🔁 بازهم آپدیت کن", f"force:{mid}".encode())]]
-    if st == "draft_ok":
+    if st == "draft_ok" and PUBLISH_UNLOCKED:
         return [[Button.inline("🚀 انتشار همین", f"pub:{mid}".encode())]]
     return None
 
@@ -349,10 +355,23 @@ def item_report(it):
 # ---------------------------------------------------------------- processing
 async def process(mid, opts):
     it = state["items"].get(str(mid))
+    manual = bool(opts.get("manual"))
+    if it is not None and not manual and it.get("status") in FINAL_STATUSES:
+        log(f"item {mid} already done; not reprocessed")
+        return
     msg = await user.get_messages(CHANNEL, ids=mid)
     post = parse_post(msg)
     if not post:
         return
+    if not manual:
+        bkey = ((post.get("bundle") or "").lower(), str(post.get("version") or ""))
+        dup = next((k for k, v in state["items"].items() if k != str(mid) and bkey[0] and v.get("status") in ("draft_ok", "published")
+                    and ((v.get("bundle") or "").lower(), str(v.get("version") or "")) == bkey), None)
+        if dup:
+            state["items"][str(mid)] = {**post, "status": "duplicate", "created": now_iso(), "updated": now_iso(), "reason": f"same app+version as {dup}"}
+            event(f"{mid} duplicate of {dup}")
+            save_state()
+            return
     if it is None:
         it = {**post, "status": "queued", "created": now_iso(), "attempts": 0}
         state["items"][str(mid)] = it
@@ -360,6 +379,8 @@ async def process(mid, opts):
     it["attempts"] = it.get("attempts", 0) + 1
     it["updated"] = now_iso()
     mode = opts.get("mode") or state.get("mode", "draft")
+    if not PUBLISH_UNLOCKED:
+        mode = "draft"
     force = bool(opts.get("force"))
     current.update(msg_id=mid, stage="match")
     reuse = mode == "publish" and it.get("status") == "draft_ok" and it.get("job_id") and (it.get("app") or {}).get("id")
@@ -404,8 +425,15 @@ async def process(mid, opts):
         it["mode"] = mode
         event(f"{mid} {it.get('status')} {it.get('name')}")
         current.update(msg_id=None, stage=None)
+        report = item_report(it)
+        rh = hashlib.sha256(report.encode()).hexdigest()[:16]
+        repeat = it.get("reported") == rh
+        it["reported"] = rh
         save_state()
-        await notify(item_report(it), buttons=item_buttons(it))
+        if not repeat:
+            await notify(report, buttons=item_buttons(it))
+        else:
+            log(f"item {mid} same result as last report; not re-sent")
 
 
 async def poll_job(it, url, post, mode):
@@ -438,15 +466,25 @@ async def worker():
     while True:
         mid, opts = await queue.get()
         if not state.get("enabled") and not opts.get("manual"):
+            inflight.discard(mid)
             continue
         try:
             await process(mid, opts)
         except Exception:
             traceback.print_exc()
+        finally:
+            inflight.discard(mid)
+
+
+inflight = set()
 
 
 def enqueue(mid, **opts):
+    if mid in inflight:
+        return False
+    inflight.add(mid)
     queue.put_nowait((mid, opts))
+    return True
 
 
 # ---------------------------------------------------------------- admin bot UI
@@ -464,6 +502,8 @@ def menu_buttons():
 def status_text():
     on = "روشن 🟢" if state.get("enabled") else "خاموش 🔴"
     mode = "فقط پیش‌نویس 📝" if state.get("mode", "draft") == "draft" else "انتشار خودکار 🚀"
+    if not PUBLISH_UNLOCKED:
+        mode += " (انتشار قفل است 🔒)"
     cur = f"\n⏳ در حال کار: {esc((state['items'].get(str(current['msg_id'])) or {}).get('name'))} ({esc(current['stage'])})" if current["msg_id"] else ""
     return f"<b>آپدیت خودکار سیب‌استار</b>\nوضعیت: {on}\nحالت: {mode}\nصف: {queue.qsize()}\nکانال: @{CHANNEL}{cur}"
 
@@ -535,6 +575,9 @@ def register_bot_handlers():
             event(f"enabled={state['enabled']}")
             await ev.answer("روشن شد" if state["enabled"] else "خاموش شد")
             await ev.edit(status_text(), buttons=menu_buttons(), parse_mode="html")
+        elif d in ("mode", "mode_pub", "pub_locked") and not PUBLISH_UNLOCKED:
+            state["mode"] = "draft"
+            await ev.answer("انتشار قفل است؛ فقط پیش‌نویس. برای باز شدن باید روی سرور و گیت‌هاب تأیید شود.", alert=True)
         elif d == "mode":
             if state.get("mode", "draft") == "draft":
                 await ev.answer()
@@ -573,14 +616,14 @@ def register_bot_handlers():
             kind, mid = d.split(":", 1)
             mid = int(mid)
             if kind == "retry":
-                enqueue(mid, manual=True)
-                await ev.answer("دوباره در صف")
+                await ev.answer("دوباره در صف" if enqueue(mid, manual=True) else "همین الان در صف است")
             elif kind == "force":
-                enqueue(mid, manual=True, force=True)
-                await ev.answer("دوباره در صف (اجباری)")
+                await ev.answer("دوباره در صف (اجباری)" if enqueue(mid, manual=True, force=True) else "همین الان در صف است")
             elif kind == "pub":
-                enqueue(mid, manual=True, mode="publish")
-                await ev.answer("در صف انتشار")
+                if not PUBLISH_UNLOCKED:
+                    await ev.answer("انتشار قفل است؛ فقط پیش‌نویس.", alert=True)
+                else:
+                    await ev.answer("در صف انتشار" if enqueue(mid, manual=True, mode="publish") else "همین الان در صف است")
             else:
                 await ev.answer()
         mark()
@@ -641,6 +684,8 @@ async def main():
     log(f"sibstar ping ok={ping.get('ok')}")
     for p in state.pop("pending", []) or []:
         mid = p.pop("id", None)
+        if not PUBLISH_UNLOCKED:
+            p.pop("mode", None)
         if mid:
             enqueue(int(mid), **p)
     await catch_up()
