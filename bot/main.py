@@ -10,15 +10,18 @@ import hashlib
 import datetime as dt
 import html
 import json
+import plistlib
 import os
 import re
 import signal
+import struct
 import subprocess
 import sys
 import time
 import traceback
 import urllib.error
 import urllib.request
+import zlib
 
 from telethon import Button, TelegramClient, events, utils
 from telethon.errors import UserAlreadyParticipantError
@@ -369,6 +372,80 @@ def item_report(it):
     return f"❌ <b>{t}</b> خطا: {esc(it.get('reason'))}"
 
 
+# ---------------------------------------------------------------- Info.plist straight from Telegram (range reads)
+async def tg_read(msg, start, end):
+    """bytes [start, end) of the message's document via aligned ranged downloads (no full download)."""
+    rs = 512 * 1024  # offsets aligned to the request size: never crosses a 1 MB boundary (MTProto rule)
+    al = start - (start % rs)
+    buf = bytearray()
+    async for chunk in user.iter_download(msg.media, offset=al, request_size=rs):
+        buf += chunk
+        if al + len(buf) >= end:
+            break
+    return bytes(buf[start - al:end - al])
+
+
+async def ipa_info(msg):
+    """Read Payload/*.app/Info.plist of the IPA in `msg` -> {bundle, version, build, name}. Raises on failure."""
+    size = msg.document.size
+    tail_len = min(size, 65536 + 22)
+    tail = await tg_read(msg, size - tail_len, size)
+    p = tail.rfind(b"PK\x05\x06")
+    if p < 0:
+        raise RuntimeError("فایل IPA معتبر نیست (zip)")
+    cd_size, cd_off = struct.unpack_from("<II", tail, p + 12)
+    if cd_size == 0xFFFFFFFF or cd_off == 0xFFFFFFFF:
+        q = tail.rfind(b"PK\x06\x07", 0, p)
+        if q < 0:
+            raise RuntimeError("zip64 نامعتبر")
+        (z64,) = struct.unpack_from("<Q", tail, q + 8)
+        rec = await tg_read(msg, z64, z64 + 56)
+        cd_size, cd_off = struct.unpack_from("<QQ", rec, 40)
+    if cd_size > 64 * 1024 * 1024:
+        raise RuntimeError("فهرست zip خیلی بزرگ است")
+    cd = await tg_read(msg, cd_off, cd_off + cd_size)
+    i = 0
+    target = None
+    while i + 46 <= len(cd) and cd[i:i + 4] == b"PK\x01\x02":
+        method, = struct.unpack_from("<H", cd, i + 10)
+        csize, usize = struct.unpack_from("<II", cd, i + 20)
+        nlen, elen, clen = struct.unpack_from("<HHH", cd, i + 28)
+        (loff,) = struct.unpack_from("<I", cd, i + 42)
+        name = cd[i + 46:i + 46 + nlen].decode("utf8", "replace")
+        extra = cd[i + 46 + nlen:i + 46 + nlen + elen]
+        if re.match(r"^Payload/[^/]+\.app/Info\.plist$", name):
+            j = 0
+            while j + 4 <= len(extra):
+                hid, hlen = struct.unpack_from("<HH", extra, j)
+                if hid == 1:
+                    vals = extra[j + 4:j + 4 + hlen]
+                    k = 0
+                    if usize == 0xFFFFFFFF:
+                        (usize,) = struct.unpack_from("<Q", vals, k); k += 8
+                    if csize == 0xFFFFFFFF:
+                        (csize,) = struct.unpack_from("<Q", vals, k); k += 8
+                    if loff == 0xFFFFFFFF:
+                        (loff,) = struct.unpack_from("<Q", vals, k); k += 8
+                j += 4 + hlen
+            target = (method, csize, loff)
+            break
+        i += 46 + nlen + elen + clen
+    if not target:
+        raise RuntimeError("Info.plist داخل IPA پیدا نشد")
+    method, csize, loff = target
+    lh = await tg_read(msg, loff, loff + 30)
+    nlen, elen = struct.unpack_from("<HH", lh, 26)
+    data = await tg_read(msg, loff + 30 + nlen + elen, loff + 30 + nlen + elen + csize)
+    raw = zlib.decompressobj(-15).decompress(data) if method == 8 else data
+    pl = plistlib.loads(raw)
+    return {
+        "bundle": str(pl.get("CFBundleIdentifier") or "") or None,
+        "version": str(pl.get("CFBundleShortVersionString") or pl.get("CFBundleVersion") or "") or None,
+        "build": str(pl.get("CFBundleVersion") or "") or None,
+        "name": str(pl.get("CFBundleDisplayName") or pl.get("CFBundleName") or "") or None,
+    }
+
+
 # ---------------------------------------------------------------- sources (channels + admin DM relay)
 def ref_of(key, mid):
     return f"{key}/{mid}"
@@ -436,6 +513,22 @@ async def process(ref, opts):
             state["items"][ref] = {"ref": ref, "chan": key, "msg_id": mid, "name": "?", "status": "skipped", "reason": "پیام IPA پیدا نشد", "created": now_iso(), "updated": now_iso()}
         return
     post["ref"], post["chan"] = ref, key
+    # caption is only a hint: the IPA's own Info.plist is the truth (any channel / any file sent to the bot)
+    try:
+        info = await ipa_info(msg)
+        if info.get("bundle"):
+            if post.get("bundle") and post["bundle"].lower() != info["bundle"].lower():
+                log(f"item {ref}: caption bundle differs from Info.plist; using Info.plist")
+            post["bundle"] = info["bundle"]
+        if info.get("version"):
+            post["version"] = info["version"]
+        if info.get("name") and not (msg.message or "").strip():
+            post["name"] = info["name"][:200]
+        post["plist"] = info
+    except Exception as e:
+        log(f"item {ref}: Info.plist read failed ({type(e).__name__}); using caption")
+        if not post.get("bundle"):
+            post["plist_error"] = str(e)[:120]
     if not manual:
         dup = same_app_version_done(ref, bundle=post.get("bundle"), version=post.get("version"))
         if dup:
@@ -568,11 +661,11 @@ STATUS_FA = {"published": "✅ آپدیت شد", "draft_ok": "📝 پیش‌نو
              "failed": "❌ خطا", "duplicate": "♻️ تکراری", "queued": "⏳ در صف"}
 
 
-async def start_batch(label, refs):
+async def start_batch(label, refs, single=False):
     bid = f"b{int(time.time() * 1000)}"
     refs = list(dict.fromkeys(refs))
     already = {r for r in refs if (state["items"].get(r) or {}).get("status") in FINAL_STATUSES}
-    batches[bid] = {"label": label, "refs": refs, "already": already}
+    batches[bid] = {"label": label, "refs": refs, "already": already, "single": single}
     for r in refs:
         if r not in already:
             enqueue(r, batch=bid)
@@ -585,6 +678,12 @@ async def check_batches():
         if any(r in inflight for r in b["refs"]):
             continue
         batches.pop(bid, None)
+        if b.get("single"):
+            r = b["refs"][0] if b["refs"] else None
+            it = state["items"].get(r) or {}
+            if r in b["already"] or it.get("status") == "duplicate":
+                await notify(f"☑️ {item_title(it)} {esc(it.get('version') or '')}: قبلاً بررسی شده/تکراری — {esc(it.get('reason') or STATUS_FA.get(it.get('status'), ''))}")
+            continue
         lines = [f"<b>{esc(b['label'])}</b>", f"پیدا شد: {len(b['refs'])} فایل IPA"]
         groups = {}
         for r in b["refs"]:
@@ -759,7 +858,7 @@ async def relay_admin_file(ev):
         return
     ref = ref_of("dm", found.id)
     await ev.respond(f"📥 دریافت شد: {esc(fn)}\nدر صف بررسی…", parse_mode="html")
-    await start_batch(f"فایل ارسالی: {fn}", [ref])
+    await start_batch(f"فایل ارسالی: {fn}", [ref], single=True)
 
 
 async def cleanup_sweeper():
