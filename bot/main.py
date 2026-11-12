@@ -1489,8 +1489,12 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
                     rows.append((ref_of(c["key"], m.id), m, p))
         except Exception as e:
             await notify(f"⚠️ کانال {esc(c['key'])} خوانده نشد: {type(e).__name__}")
+    log(f"audit: {len(rows)} IPA posts in the last {hours}h")
     out = []
     for i, (ref, m, p) in enumerate(rows, 1):
+        state["audit_progress"] = {"t": now_iso(), "i": i, "n": len(rows)}
+        if i % 10 == 0:
+            mark()
         if i == 1 or i % 3 == 0:
             await edit_msg(progress, f"⏳ <b>بررسی پوشش {hours} ساعت اخیر</b>\n🔍 مقایسه با سایت: {i}/{len(rows)} — {esc(p.get('name'))}")
         it = state["items"].get(ref)
@@ -1502,12 +1506,16 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
         if recheck:
             if it is None:
                 try:
-                    info = await ipa_info(m)
+                    info = await asyncio.wait_for(ipa_info(m), 60)
                     r["bundle"] = info.get("bundle") or r["bundle"]
                     r["version"] = info.get("version") or r["version"]
-                except Exception:
-                    pass
-            mm = await sib({"action": "match", "name": r["name"], "bundleId": r["bundle"], "version": r["version"]}, tries=2)
+                except Exception as e:
+                    log(f"audit: plist {ref} skipped ({type(e).__name__})")
+            try:
+                mm = await asyncio.wait_for(sib({"action": "match", "name": r["name"], "bundleId": r["bundle"], "version": r["version"]}, tries=2), 90)
+            except Exception as e:
+                log(f"audit: match {ref} failed ({type(e).__name__})")
+                mm = {"outcome": "error"}
             oc = mm.get("outcome")
             app = mm.get("app") or {}
             r["site"] = {"name": app.get("nameFa") or app.get("name"), "version": app.get("version"), "slug": app.get("slug")}
@@ -1521,6 +1529,8 @@ async def coverage_audit(hours=AUDIT_HOURS, notify_result=True, progress=None):
             out.append({"ref": k, "name": it.get("name"), "version": it.get("version"), "bundle": it.get("bundle"), "posted": it.get("created"),
                         "bot": it.get("status"), "code": it.get("code"), "reason": it.get("reason"), "dm": True})
     state["audit"] = {"t": now_iso(), "hours": hours, "rows": out}
+    state.pop("audit_progress", None)
+    log(f"audit done: {len(out)} rows, missed {sum(1 for r in out if r.get('missed'))}")
     mark()
     save_state()
     if notify_result:
@@ -2078,6 +2088,7 @@ async def main():
                     prog = await progress_msg(f"⏳ بررسی پست‌های {day_label(day)}…")
                     await scan_day(day, f"چک آپدیت‌های {day_label(day)}", progress=prog)
                     t1 = time.time()
+                    log(f"test scan {ref}: waiting for {len(batches)} batch(es)")
                     while batches and time.time() - t1 < 3 * 3600:
                         await asyncio.sleep(10)
                     st = "scanned"
