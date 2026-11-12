@@ -1,6 +1,7 @@
 """SibStar Telegram IPA auto-updater.
 
-User account watches @blatants -> forwards each new .ipa to @linkbefileeTGbot -> gets the direct link ->
+User account watches the configured source channels (default @blatants; add/remove from the admin bot) and
+IPA files sent/forwarded to the admin bot -> forwards each new .ipa to @linkbefileeTGbot -> gets the direct link ->
 asks SibStar (/api/internal/auto-ipa-update) to stage-import it for the matching EXISTING app ->
 draft (default) or publish. Admin bot (@erfanitt only) reports and controls everything.
 """
@@ -19,10 +20,14 @@ import traceback
 import urllib.error
 import urllib.request
 
-from telethon import Button, TelegramClient, events
+from telethon import Button, TelegramClient, events, utils
+from telethon.errors import UserAlreadyParticipantError
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import CheckChatInviteRequest, ImportChatInviteRequest
+from telethon.tl.types import Channel
 
-CHANNEL = os.environ.get("SOURCE_CHANNEL", "blatants")
+DEFAULT_CHANNEL = os.environ.get("SOURCE_CHANNEL", "blatants").lower()
 LINKBOT = os.environ.get("LINK_BOT", "linkbefileeTGbot")
 ENDPOINT = os.environ["SIBSTAR_ENDPOINT"]
 SECRET = os.environ.get("SIBSTAR_ENDPOINT_SECRET", "")
@@ -39,7 +44,9 @@ STATE_KEY = os.environ.get("STATE_KEY", "")  # state is pushed ONLY encrypted (p
 # Publishing is LOCKED unless the repo variable PUBLISH_UNLOCKED=1 is set (Erfan's explicit approval).
 PUBLISH_UNLOCKED = os.environ.get("PUBLISH_UNLOCKED", "0") == "1"
 FINAL_STATUSES = ("draft_ok", "published", "skipped", "rejected", "duplicate")
-TEST_MESSAGE_ID = int(os.environ.get("TEST_MESSAGE_ID", "0") or 0)
+# one-off test run (workflow_dispatch inputs): refs like "blatants/13480"; TEST_MODE=publish is explicit approval
+TEST_REFS = [r.strip() if "/" in r else f"{DEFAULT_CHANNEL}/{r.strip()}" for r in os.environ.get("TEST_REFS", os.environ.get("TEST_MESSAGE_ID", "")).split(",") if r.strip() and r.strip() != "0"]
+TEST_MODE = "publish" if os.environ.get("TEST_MODE") == "publish" else "draft"
 PROXY = None
 if os.environ.get("BOX_PROXY"):
     h, p = os.environ["BOX_PROXY"].rsplit(":", 1)
@@ -47,14 +54,15 @@ if os.environ.get("BOX_PROXY"):
 TEHRAN = dt.timezone(dt.timedelta(hours=3, minutes=30))
 
 STATE_FILE = os.path.join(STATE_DIR, "state.json")
-DEFAULT_STATE = {"enabled": True, "mode": "draft", "admin_id": ADMIN_ID_ENV or None, "last_msg_id": 0, "items": {}, "log": []}
+DEFAULT_STATE = {"enabled": True, "mode": "draft", "admin_id": ADMIN_ID_ENV or None, "items": {}, "log": [],
+                 "channels": [{"key": DEFAULT_CHANNEL, "peer": DEFAULT_CHANNEL, "title": DEFAULT_CHANNEL}], "last_ids": {}}
 
 state = {}
 dirty = False
 queue: "asyncio.Queue[tuple[int, dict]]" = None  # type: ignore
 user: TelegramClient = None  # type: ignore
 bot: TelegramClient = None  # type: ignore
-current = {"msg_id": None, "stage": None}
+current = {"ref": None, "stage": None}
 
 
 def now_iso():
@@ -84,6 +92,13 @@ def load_state():
         state.setdefault(k, json.loads(json.dumps(v)))
     if ADMIN_ID_ENV and not state.get("admin_id"):
         state["admin_id"] = ADMIN_ID_ENV
+    # v2 migration: numeric item keys / last_msg_id belonged to @blatants
+    if "last_msg_id" in state:
+        state.setdefault("last_ids", {}).setdefault(DEFAULT_CHANNEL, int(state.pop("last_msg_id") or 0))
+    for k in [k for k in state["items"] if "/" not in k]:
+        it = state["items"].pop(k)
+        it.update(ref=f"{DEFAULT_CHANNEL}/{k}", chan=DEFAULT_CHANNEL)
+        state["items"][f"{DEFAULT_CHANNEL}/{k}"] = it
     if not PUBLISH_UNLOCKED and state.get("mode") != "draft":
         state["mode"] = "draft"
         event("mode forced to draft (publish locked)")
@@ -108,7 +123,7 @@ def save_state(push=True):
     os.makedirs(STATE_DIR, exist_ok=True)
     items = state["items"]
     if len(items) > 400:
-        for k in sorted(items, key=lambda x: int(x))[:-400]:
+        for k in sorted(items, key=lambda x: (items[x].get("updated") or ""))[:-400]:
             items.pop(k, None)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf8") as f:
@@ -187,8 +202,10 @@ def parse_post(m):
         return None
     cap = m.message or ""
     first = cap.strip().split("\n")[0].strip() if cap.strip() else ""
-    b = re.search(r"Bundle ID:\s*(\S+)", cap)
-    v = re.search(r"Updated to:\s*(\S+)", cap)
+    b = re.search(r"(?:Bundle\s*ID|Bundle|باندل)\s*[:：]\s*([A-Za-z0-9][\w.-]+)", cap, re.I)
+    v = re.search(r"(?:Updated to|Version|نسخه)\s*[:：]\s*(\S+)", cap, re.I)
+    if not v:
+        v = re.search(r"[_ ]v(\d[\d.]*\d|\d)(?=[_ .])", fn)
     name = first
     if not name:
         base = re.sub(r"\.ipa$", "", fn, flags=re.I)
@@ -299,7 +316,7 @@ def item_title(it):
 
 
 def item_buttons(it):
-    mid = it["msg_id"]
+    mid = it.get("ref") or f"{DEFAULT_CHANNEL}/{it.get('msg_id')}"
     st = it.get("status")
     if st in ("failed", "rejected", "error"):
         return [[Button.inline("🔁 تلاش دوباره", f"retry:{mid}".encode())]]
@@ -352,45 +369,99 @@ def item_report(it):
     return f"❌ <b>{t}</b> خطا: {esc(it.get('reason'))}"
 
 
+# ---------------------------------------------------------------- sources (channels + admin DM relay)
+def ref_of(key, mid):
+    return f"{key}/{mid}"
+
+
+def ref_split(ref):
+    key, _, mid = str(ref).rpartition("/")
+    return key, int(mid)
+
+
+def channel_keys():
+    return [c["key"] for c in state.get("channels", [])]
+
+
+async def peer_for(key):
+    if key == "dm":
+        return await user.get_entity(BOT_USERNAME)
+    for c in state.get("channels", []):
+        if c["key"] == key:
+            return await user.get_entity(c["peer"])
+    raise RuntimeError("کانال در فهرست نیست")
+
+
+async def resolve_channel_ids():
+    try:
+        await user.get_dialogs(limit=None)
+    except Exception:
+        pass
+    for c in state.get("channels", []):
+        try:
+            ent = await user.get_entity(c["peer"])
+            chan_ids[utils.get_peer_id(ent)] = c["key"]
+        except Exception as e:
+            log(f"channel {c['key']} not resolvable: {type(e).__name__}")
+
+
+def same_app_version_done(ref, app_id=None, bundle=None, version=None):
+    """cross-channel dedupe: another item with the same app (or bundle) + version already reported ok."""
+    if not version:
+        return None
+    for k, v in state["items"].items():
+        if k == ref or v.get("status") not in ("draft_ok", "published"):
+            continue
+        if str(v.get("version") or "") != str(version):
+            continue
+        if app_id and (v.get("app") or {}).get("id") == app_id:
+            return k
+        if bundle and (v.get("bundle") or "").lower() == bundle.lower():
+            return k
+    return None
+
+
 # ---------------------------------------------------------------- processing
-async def process(mid, opts):
-    it = state["items"].get(str(mid))
+async def process(ref, opts):
+    it = state["items"].get(ref)
     manual = bool(opts.get("manual"))
     if it is not None and not manual and it.get("status") in FINAL_STATUSES:
-        log(f"item {mid} already done; not reprocessed")
+        log(f"item {ref} already done; not reprocessed")
         return
-    msg = await user.get_messages(CHANNEL, ids=mid)
+    key, mid = ref_split(ref)
+    msg = await user.get_messages(await peer_for(key), ids=mid)
     post = parse_post(msg)
     if not post:
+        if it is None:
+            state["items"][ref] = {"ref": ref, "chan": key, "msg_id": mid, "name": "?", "status": "skipped", "reason": "پیام IPA پیدا نشد", "created": now_iso(), "updated": now_iso()}
         return
+    post["ref"], post["chan"] = ref, key
     if not manual:
-        bkey = ((post.get("bundle") or "").lower(), str(post.get("version") or ""))
-        dup = next((k for k, v in state["items"].items() if k != str(mid) and bkey[0] and v.get("status") in ("draft_ok", "published")
-                    and ((v.get("bundle") or "").lower(), str(v.get("version") or "")) == bkey), None)
+        dup = same_app_version_done(ref, bundle=post.get("bundle"), version=post.get("version"))
         if dup:
-            state["items"][str(mid)] = {**post, "status": "duplicate", "created": now_iso(), "updated": now_iso(), "reason": f"same app+version as {dup}"}
-            event(f"{mid} duplicate of {dup}")
+            state["items"][ref] = {**post, "status": "duplicate", "created": now_iso(), "updated": now_iso(), "reason": f"تکراری (همان برنامه و نسخه: {dup})"}
+            event(f"{ref} duplicate of {dup}")
             save_state()
             return
     if it is None:
         it = {**post, "status": "queued", "created": now_iso(), "attempts": 0}
-        state["items"][str(mid)] = it
-    it.update({k: post[k] for k in ("name", "bundle", "version", "file", "size")})
+        state["items"][ref] = it
+    it.update({k: post[k] for k in ("name", "bundle", "version", "file", "size", "ref", "chan", "msg_id")})
     it["attempts"] = it.get("attempts", 0) + 1
     it["updated"] = now_iso()
     mode = opts.get("mode") or state.get("mode", "draft")
-    if not PUBLISH_UNLOCKED:
+    if not (PUBLISH_UNLOCKED or opts.get("test_publish")):
         mode = "draft"
     force = bool(opts.get("force"))
-    current.update(msg_id=mid, stage="match")
+    current.update(ref=ref, stage="match")
     reuse = mode == "publish" and it.get("status") == "draft_ok" and it.get("job_id") and (it.get("app") or {}).get("id")
     mark()
+    silent = False
     try:
         if reuse:
             url = it.get("url") or ""
             current["stage"] = "publish"
             return await poll_job(it, url, post, mode)
-        # 1) match only (cheap) before using the link bot
         m = await sib({"action": "match", "name": post["name"], "bundleId": post["bundle"], "version": post["version"], "force": force})
         if m.get("outcome") == "skipped":
             it.update(status="skipped", code=m.get("code"), reason=m.get("reasonFa"), app=m.get("app"))
@@ -398,14 +469,18 @@ async def process(mid, opts):
         if m.get("outcome") != "match":
             raise RuntimeError(m.get("reasonFa") or "خطای تطبیق")
         it["app"] = m.get("app")
-        # 2) link
+        if not manual:
+            dup = same_app_version_done(ref, app_id=(m.get("app") or {}).get("id"), version=post.get("version"))
+            if dup:
+                it.update(status="duplicate", reason=f"تکراری (همان برنامه و نسخه: {dup})")
+                silent = True
+                return
         current["stage"] = "link"
         url = it.get("url") if it.get("url") and (time.time() - it.get("url_ts", 0) < 4 * 3600) else None
         if not url:
             url = await get_link(msg)
             it.update(url=url, url_ts=time.time())
             mark()
-        # 3) stage import
         current["stage"] = "import"
         s = await sib({"action": "start", "name": post["name"], "bundleId": post["bundle"], "version": post["version"], "fileName": post["file"], "sourceUrl": url, "force": force})
         if s.get("outcome") == "skipped":
@@ -418,22 +493,24 @@ async def process(mid, opts):
         await poll_job(it, url, post, mode)
     except Exception as e:
         it.update(status="failed", reason=str(e)[:300])
-        log(f"item {mid} failed: {type(e).__name__}")
+        log(f"item {ref} failed: {type(e).__name__}")
         traceback.print_exc(limit=2)
     finally:
         it["updated"] = now_iso()
         it["mode"] = mode
-        event(f"{mid} {it.get('status')} {it.get('name')}")
-        current.update(msg_id=None, stage=None)
+        event(f"{ref} {it.get('status')} {it.get('name')}")
+        current.update(ref=None, stage=None)
         report = item_report(it)
         rh = hashlib.sha256(report.encode()).hexdigest()[:16]
         repeat = it.get("reported") == rh
         it["reported"] = rh
         save_state()
-        if not repeat:
+        if silent:
+            pass
+        elif not repeat:
             await notify(report, buttons=item_buttons(it))
         else:
-            log(f"item {mid} same result as last report; not re-sent")
+            log(f"item {ref} same result as last report; not re-sent")
 
 
 async def poll_job(it, url, post, mode):
@@ -464,27 +541,242 @@ async def poll_job(it, url, post, mode):
 
 async def worker():
     while True:
-        mid, opts = await queue.get()
-        if not state.get("enabled") and not opts.get("manual"):
-            inflight.discard(mid)
-            continue
+        ref, opts = await queue.get()
         try:
-            await process(mid, opts)
+            if state.get("enabled") or opts.get("manual") or opts.get("batch"):
+                await process(ref, opts)
         except Exception:
             traceback.print_exc()
         finally:
-            inflight.discard(mid)
+            inflight.discard(ref)
+            await check_batches()
 
 
 inflight = set()
+batches = {}
 
 
-def enqueue(mid, **opts):
-    if mid in inflight:
+def enqueue(ref, **opts):
+    if ref in inflight:
         return False
-    inflight.add(mid)
-    queue.put_nowait((mid, opts))
+    inflight.add(ref)
+    queue.put_nowait((ref, opts))
     return True
+
+
+STATUS_FA = {"published": "✅ آپدیت شد", "draft_ok": "📝 پیش‌نویس آماده", "skipped": "⚠️ رد شد", "rejected": "⛔️ رد (بررسی)",
+             "failed": "❌ خطا", "duplicate": "♻️ تکراری", "queued": "⏳ در صف"}
+
+
+async def start_batch(label, refs):
+    bid = f"b{int(time.time() * 1000)}"
+    refs = list(dict.fromkeys(refs))
+    already = {r for r in refs if (state["items"].get(r) or {}).get("status") in FINAL_STATUSES}
+    batches[bid] = {"label": label, "refs": refs, "already": already}
+    for r in refs:
+        if r not in already:
+            enqueue(r, batch=bid)
+    await check_batches()
+    return bid
+
+
+async def check_batches():
+    for bid, b in list(batches.items()):
+        if any(r in inflight for r in b["refs"]):
+            continue
+        batches.pop(bid, None)
+        lines = [f"<b>{esc(b['label'])}</b>", f"پیدا شد: {len(b['refs'])} فایل IPA"]
+        groups = {}
+        for r in b["refs"]:
+            it = state["items"].get(r) or {"status": "failed", "reason": "پردازش نشد"}
+            st = "already" if r in b["already"] else it.get("status", "?")
+            groups.setdefault(st, []).append(it)
+        lab = dict(STATUS_FA, already="☑️ قبلاً بررسی شده")
+        for st, its in groups.items():
+            lines.append(f"\n{lab.get(st, st)}: {len(its)}")
+            for it in its[:15]:
+                why = "" if st in ("published", "draft_ok", "already") else f" — {esc((it.get('reason') or '')[:70])}"
+                lines.append(f"• {item_title(it)} {esc(it.get('version') or '')}{why}")
+        if not b["refs"]:
+            lines.append("هیچ IPA در این بازه پیدا نشد.")
+        await notify("\n".join(lines)[:3900])
+
+
+def tehran_day_bounds(d):
+    start = dt.datetime(d.year, d.month, d.day, tzinfo=TEHRAN)
+    return start.astimezone(dt.timezone.utc), (start + dt.timedelta(days=1)).astimezone(dt.timezone.utc)
+
+
+def jalali_to_gregorian(jy, jm, jd):
+    jy += 1595
+    days = -355668 + (365 * jy) + (jy // 33) * 8 + ((jy % 33) + 3) // 4 + jd + ((jm - 1) * 31 if jm < 7 else ((jm - 7) * 30) + 186)
+    gy = 400 * (days // 146097)
+    days %= 146097
+    if days > 36524:
+        days -= 1
+        gy += 100 * (days // 36524)
+        days %= 36524
+        if days >= 365:
+            days += 1
+    gy += 4 * (days // 1461)
+    days %= 1461
+    if days > 365:
+        gy += (days - 1) // 365
+        days = (days - 1) % 365
+    gd = days + 1
+    leap = (gy % 4 == 0 and gy % 100 != 0) or gy % 400 == 0
+    months = [0, 31, 29 if leap else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    gm = 1
+    while gm <= 12 and gd > months[gm]:
+        gd -= months[gm]
+        gm += 1
+    return dt.date(gy, gm, gd)
+
+
+FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def parse_day(text):
+    t = (text or "").strip().translate(FA_DIGITS)
+    if t in ("امروز", "today"):
+        return dt.datetime.now(TEHRAN).date()
+    if t in ("دیروز", "yesterday"):
+        return dt.datetime.now(TEHRAN).date() - dt.timedelta(days=1)
+    m = re.match(r"^(\d{4})[/\-.](\d{1,2})[/\-.](\d{1,2})$", t)
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    try:
+        return jalali_to_gregorian(y, mo, d) if y < 1700 else dt.date(y, mo, d)
+    except Exception:
+        return None
+
+
+async def scan_day(day, label):
+    start, end = tehran_day_bounds(day)
+    refs = []
+    for c in list(state.get("channels", [])):
+        try:
+            peer = await user.get_entity(c["peer"])
+            async for m in user.iter_messages(peer, offset_date=end, limit=500):
+                if m.date and m.date < start:
+                    break
+                if parse_post(m):
+                    refs.append(ref_of(c["key"], m.id))
+        except Exception as e:
+            await notify(f"⚠️ کانال {esc(c['key'])} خوانده نشد: {type(e).__name__}")
+    refs.sort(key=lambda r: ref_split(r)[1])
+    await start_batch(label, refs)
+
+
+def parse_channel_input(text):
+    t = (text or "").strip()
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:joinchat/|\+)([\w-]+)", t)
+    if m:
+        return {"invite": m.group(1)}
+    m = re.search(r"(?:t\.me|telegram\.me)/(?:s/)?([A-Za-z][\w]{3,})", t) or re.match(r"^@?([A-Za-z][\w]{3,})$", t)
+    if m:
+        return {"username": m.group(1)}
+    return None
+
+
+async def add_channel(text):
+    p = parse_channel_input(text)
+    if not p:
+        return "❌ آدرس کانال نامعتبر است. مثل @blatants یا https://t.me/blatants بفرست."
+    if p.get("invite"):
+        try:
+            res = await user(ImportChatInviteRequest(p["invite"]))
+            ent = res.chats[0]
+        except UserAlreadyParticipantError:
+            info = await user(CheckChatInviteRequest(p["invite"]))
+            ent = getattr(info, "chat", None)
+            if ent is None:
+                return "❌ لینک دعوت معتبر نیست."
+        key, peer = f"c{ent.id}", utils.get_peer_id(ent)
+    else:
+        ent = await user.get_entity(p["username"])
+        if not isinstance(ent, Channel):
+            return "❌ این آدرس کانال نیست."
+        try:
+            await user(JoinChannelRequest(ent))
+        except Exception:
+            pass  # already joined / public read is enough
+        key, peer = p["username"].lower(), p["username"]
+    if key in channel_keys():
+        return f"ℹ️ کانال {esc(key)} از قبل در فهرست است."
+    latest = 0
+    async for m in user.iter_messages(ent, limit=1):
+        latest = m.id
+    state["channels"].append({"key": key, "peer": peer, "title": getattr(ent, "title", key)})
+    state.setdefault("last_ids", {})[key] = latest
+    chan_ids[utils.get_peer_id(ent)] = key
+    event(f"channel added {key}")
+    save_state()
+    return f"✅ کانال «{esc(getattr(ent, 'title', key))}» اضافه شد. از پست‌های بعدی بررسی می‌شود (برای قبلی‌ها از «چک یک روز» استفاده کن)."
+
+
+def channels_text():
+    chs = state.get("channels", [])
+    if not chs:
+        return "هیچ کانالی تنظیم نشده."
+    return "<b>کانال‌های منبع</b>\n" + "\n".join(f"• {esc(c.get('title') or c['key'])} ({esc(c['key'])})" for c in chs)
+
+
+def channels_buttons():
+    rows = [[Button.inline(f"🗑 حذف {c['key']}"[:60], f"chdel:{c['key']}".encode())] for c in state.get("channels", [])]
+    rows.append([Button.inline("➕ افزودن کانال", b"chadd")])
+    return rows
+
+
+async def relay_admin_file(ev):
+    """Admin sent/forwarded an IPA to the admin bot: relay it to the user account, then the normal flow."""
+    doc = ev.message.document
+    fn = next((a.file_name for a in doc.attributes if getattr(a, "file_name", None)), "")
+    if not fn.lower().endswith(".ipa"):
+        await ev.respond("فقط فایل .ipa قبول می‌شود.")
+        return
+    cap = ev.message.message or ""
+    fwd = ev.message.fwd_from
+    if fwd and getattr(fwd, "from_name", None):
+        cap = cap or fwd.from_name
+    botent = await user.get_entity(BOT_USERNAME)
+    last = 0
+    async for m in user.iter_messages(botent, limit=1):
+        last = m.id
+    await bot.send_file(MY_USER_ID, file=ev.message.media, caption=cap[:1000])
+    found = None
+    for _ in range(20):
+        await asyncio.sleep(2)
+        async for m in user.iter_messages(botent, min_id=last, limit=10):
+            if m.document and m.document.size == doc.size:
+                found = m
+                break
+        if found:
+            break
+    if not found:
+        await ev.respond("❌ فایل به حساب کاربر نرسید؛ دوباره بفرست.")
+        return
+    ref = ref_of("dm", found.id)
+    await ev.respond(f"📥 دریافت شد: {esc(fn)}\nدر صف بررسی…", parse_mode="html")
+    await start_batch(f"فایل ارسالی: {fn}", [ref])
+
+
+async def cleanup_sweeper():
+    """publish mode only: hourly strict cleanup of previous files / superseded draft imports (server re-checks)."""
+    while True:
+        await asyncio.sleep(3600)
+        if not (PUBLISH_UNLOCKED and state.get("enabled") and state.get("mode") == "publish"):
+            continue
+        try:
+            r = await sib({"action": "cleanup", "dryRun": False, "limit": 20})
+            done = [x for x in r.get("results", []) if x.get("deleted")]
+            if done:
+                mb = sum(int(x.get("bytes") or 0) for x in done) / 1e6
+                event(f"cleanup deleted {len(done)} files ({mb:.0f} MB)")
+                await notify(f"🧹 {len(done)} فایل قبلی/پیش‌نویس جایگزین‌شده حذف شد ({mb:.0f} مگابایت).")
+        except Exception as e:
+            log(f"cleanup failed: {type(e).__name__}")
 
 
 # ---------------------------------------------------------------- admin bot UI
@@ -494,8 +786,9 @@ def menu_buttons():
     return [
         [Button.inline("🔴 خاموش کن" if on else "🟢 روشن کن", b"toggle"), Button.inline("📊 وضعیت", b"status")],
         [Button.inline("📝 حالت: فقط پیش‌نویس، منتشر نکن" if draft else "🚀 حالت: انتشار خودکار", b"mode")],
-        [Button.inline("📅 گزارش امروز", b"today"), Button.inline("🕘 آخرین کارها", b"recent")],
-        [Button.inline("🔁 تلاش دوباره خطاها", b"retryall")],
+        [Button.inline("🔎 چک آپدیت‌های امروز", b"scan_today"), Button.inline("📆 چک آپدیت‌های یک روز", b"scan_day")],
+        [Button.inline("📡 کانال‌ها", b"channels"), Button.inline("🕘 آخرین کارها", b"recent")],
+        [Button.inline("📅 گزارش امروز", b"today"), Button.inline("🔁 تلاش دوباره خطاها", b"retryall")],
     ]
 
 
@@ -504,8 +797,9 @@ def status_text():
     mode = "فقط پیش‌نویس 📝" if state.get("mode", "draft") == "draft" else "انتشار خودکار 🚀"
     if not PUBLISH_UNLOCKED:
         mode += " (انتشار قفل است 🔒)"
-    cur = f"\n⏳ در حال کار: {esc((state['items'].get(str(current['msg_id'])) or {}).get('name'))} ({esc(current['stage'])})" if current["msg_id"] else ""
-    return f"<b>آپدیت خودکار سیب‌استار</b>\nوضعیت: {on}\nحالت: {mode}\nصف: {queue.qsize()}\nکانال: @{CHANNEL}{cur}"
+    cur = f"\n⏳ در حال کار: {esc((state['items'].get(current['ref'] or '') or {}).get('name'))} ({esc(current['stage'])})" if current["ref"] else ""
+    chs = "، ".join(esc(c["key"]) for c in state.get("channels", [])) or "—"
+    return f"<b>آپدیت خودکار سیب‌استار</b>\nوضعیت: {on}\nحالت: {mode}\nصف: {queue.qsize()}\nکانال‌ها: {chs}{cur}\n\nمی‌توانی فایل IPA را مستقیم بفرستی یا فوروارد کنی."
 
 
 def today_text():
@@ -549,18 +843,53 @@ def is_admin(ev):
     return bool(s and (getattr(s, "username", "") or "").lower() == ADMIN_USERNAME)
 
 
+awaiting = {"kind": None}
+
+
 def register_bot_handlers():
-    @bot.on(events.NewMessage(pattern=r"^/(start|menu)"))
-    async def on_start(ev):
+    @bot.on(events.NewMessage(incoming=True))
+    async def on_msg(ev):
+        if not ev.is_private:
+            return
         await ev.get_sender()
         if not is_admin(ev):
-            await ev.respond("این ربات خصوصی است.")
+            if (ev.message.message or "").startswith("/start"):
+                await ev.respond("این ربات خصوصی است.")
             return
         if not state.get("admin_id"):
             state["admin_id"] = ev.sender_id
-            mark()
         state["admin_seen"] = now_iso()
         mark()
+        text = (ev.message.message or "").strip()
+        if ev.message.document:
+            awaiting["kind"] = None
+            try:
+                await relay_admin_file(ev)
+            except Exception as e:
+                await ev.respond(f"❌ خطا در دریافت فایل: {type(e).__name__}")
+            return
+        if text.startswith("/start") or text.startswith("/menu"):
+            awaiting["kind"] = None
+            await ev.respond(status_text(), buttons=menu_buttons(), parse_mode="html")
+            return
+        kind = awaiting["kind"]
+        if kind == "day":
+            d = parse_day(text)
+            if not d:
+                await ev.respond("تاریخ را نفهمیدم. مثل ۱۴۰۵/۰۸/۲۱ یا 2026-11-12 یا «دیروز» بفرست.")
+                return
+            awaiting["kind"] = None
+            await ev.respond(f"🔎 بررسی پست‌های {d.isoformat()} در همهٔ کانال‌ها…")
+            await scan_day(d, f"چک آپدیت‌های روز {d.isoformat()}")
+            return
+        if kind == "addch":
+            awaiting["kind"] = None
+            try:
+                msg = await add_channel(text)
+            except Exception as e:
+                msg = f"❌ اضافه نشد: {type(e).__name__}"
+            await ev.respond(msg, parse_mode="html", buttons=channels_buttons())
+            return
         await ev.respond(status_text(), buttons=menu_buttons(), parse_mode="html")
 
     @bot.on(events.CallbackQuery())
@@ -575,9 +904,9 @@ def register_bot_handlers():
             event(f"enabled={state['enabled']}")
             await ev.answer("روشن شد" if state["enabled"] else "خاموش شد")
             await ev.edit(status_text(), buttons=menu_buttons(), parse_mode="html")
-        elif d in ("mode", "mode_pub", "pub_locked") and not PUBLISH_UNLOCKED:
+        elif d in ("mode", "mode_pub") and not PUBLISH_UNLOCKED:
             state["mode"] = "draft"
-            await ev.answer("انتشار قفل است؛ فقط پیش‌نویس. برای باز شدن باید روی سرور و گیت‌هاب تأیید شود.", alert=True)
+            await ev.answer("انتشار خودکار قفل است؛ فقط پیش‌نویس.", alert=True)
         elif d == "mode":
             if state.get("mode", "draft") == "draft":
                 await ev.answer()
@@ -596,6 +925,7 @@ def register_bot_handlers():
             await ev.answer("انتشار خودکار روشن شد")
             await ev.edit("🚀 انتشار خودکار روشن شد.\n" + status_text(), buttons=menu_buttons(), parse_mode="html")
         elif d == "noop":
+            awaiting["kind"] = None
             await ev.answer("لغو شد")
             await ev.delete()
         elif d == "status":
@@ -607,23 +937,49 @@ def register_bot_handlers():
         elif d == "recent":
             await ev.answer()
             await ev.respond(recent_text(), parse_mode="html")
+        elif d == "scan_today":
+            await ev.answer("در حال بررسی…")
+            day = dt.datetime.now(TEHRAN).date()
+            await ev.respond(f"🔎 بررسی پست‌های امروز ({day.isoformat()}) در همهٔ کانال‌ها…")
+            await scan_day(day, f"چک آپدیت‌های امروز ({day.isoformat()})")
+        elif d == "scan_day":
+            awaiting["kind"] = "day"
+            await ev.answer()
+            await ev.respond("تاریخ را بفرست (شمسی مثل ۱۴۰۵/۰۸/۲۱ یا میلادی مثل 2026-11-12 یا «دیروز»):",
+                             buttons=[[Button.inline("لغو", b"noop")]])
+        elif d == "channels":
+            await ev.answer()
+            await ev.respond(channels_text(), buttons=channels_buttons(), parse_mode="html")
+        elif d == "chadd":
+            awaiting["kind"] = "addch"
+            await ev.answer()
+            await ev.respond("آیدی یا لینک کانال را بفرست (مثل @blatants یا https://t.me/blatants یا لینک دعوت):",
+                             buttons=[[Button.inline("لغو", b"noop")]])
+        elif d.startswith("chdel:"):
+            key = d.split(":", 1)[1]
+            state["channels"] = [c for c in state.get("channels", []) if c["key"] != key]
+            for pid, k in list(chan_ids.items()):
+                if k == key:
+                    chan_ids.pop(pid, None)
+            event(f"channel removed {key}")
+            await ev.answer("حذف شد")
+            await ev.edit(channels_text(), buttons=channels_buttons(), parse_mode="html")
         elif d == "retryall":
-            ids = [int(k) for k, v in state["items"].items() if v.get("status") == "failed"]
-            for i in sorted(ids):
-                enqueue(i, manual=True)
-            await ev.answer(f"{len(ids)} مورد دوباره در صف")
+            refs = [k for k, v in state["items"].items() if v.get("status") == "failed"]
+            for r in sorted(refs):
+                enqueue(r, manual=True)
+            await ev.answer(f"{len(refs)} مورد دوباره در صف")
         elif ":" in d:
-            kind, mid = d.split(":", 1)
-            mid = int(mid)
+            kind, ref = d.split(":", 1)
             if kind == "retry":
-                await ev.answer("دوباره در صف" if enqueue(mid, manual=True) else "همین الان در صف است")
+                await ev.answer("دوباره در صف" if enqueue(ref, manual=True) else "همین الان در صف است")
             elif kind == "force":
-                await ev.answer("دوباره در صف (اجباری)" if enqueue(mid, manual=True, force=True) else "همین الان در صف است")
+                await ev.answer("دوباره در صف (اجباری)" if enqueue(ref, manual=True, force=True) else "همین الان در صف است")
             elif kind == "pub":
                 if not PUBLISH_UNLOCKED:
                     await ev.answer("انتشار قفل است؛ فقط پیش‌نویس.", alert=True)
                 else:
-                    await ev.answer("در صف انتشار" if enqueue(mid, manual=True, mode="publish") else "همین الان در صف است")
+                    await ev.answer("در صف انتشار" if enqueue(ref, manual=True, mode="publish") else "همین الان در صف است")
             else:
                 await ev.answer()
         mark()
@@ -631,27 +987,39 @@ def register_bot_handlers():
 
 # ---------------------------------------------------------------- channel watch
 async def catch_up():
-    last = int(state.get("last_msg_id") or 0)
-    latest = None
-    found = []
-    async for m in user.iter_messages(CHANNEL, limit=60, min_id=last):
-        latest = max(latest or 0, m.id)
-        if last and parse_post(m):
-            found.append(m.id)
-    if not last:
-        state["last_msg_id"] = latest or 0
-        event(f"first run: starting after message {latest}")
-        return
-    for mid in sorted(found):
-        if str(mid) not in state["items"]:
-            enqueue(mid)
-    if latest:
-        state["last_msg_id"] = max(last, latest)
+    last_ids = state.setdefault("last_ids", {})
+    for c in list(state.get("channels", [])):
+        key = c["key"]
+        last = int(last_ids.get(key) or 0)
+        latest, found = None, []
+        try:
+            peer = await user.get_entity(c["peer"])
+            async for m in user.iter_messages(peer, limit=60, min_id=last):
+                latest = max(latest or 0, m.id)
+                if last and parse_post(m):
+                    found.append(m.id)
+        except Exception as e:
+            log(f"catch-up {key} failed: {type(e).__name__}")
+            continue
+        if not last:
+            last_ids[key] = latest or 0
+            event(f"{key}: starting after message {latest}")
+            continue
+        for mid in sorted(found):
+            if ref_of(key, mid) not in state["items"]:
+                enqueue(ref_of(key, mid))
+        if latest:
+            last_ids[key] = max(last, latest)
     mark()
 
 
+chan_ids = {}
+BOT_USERNAME = ""
+MY_USER_ID = 0
+
+
 async def main():
-    global queue, user, bot
+    global queue, user, bot, BOT_USERNAME, MY_USER_ID
     load_state()
     queue = asyncio.Queue()
     user = TelegramClient(StringSession(SESSION), API_ID, API_HASH, proxy=PROXY, connection_retries=10, retry_delay=5)
@@ -662,6 +1030,8 @@ async def main():
         sys.exit(2)
     await bot.start(bot_token=BOT_TOKEN)
     me = await user.get_me()
+    MY_USER_ID = me.id
+    BOT_USERNAME = (await bot.get_me()).username
     log(f"user ok id={me.id}; bot ok")
     if not state.get("admin_id"):
         try:
@@ -669,35 +1039,50 @@ async def main():
             state["admin_id"] = ent.id
         except Exception:
             pass
+    if not state.get("relay_ready"):
+        try:
+            await user.send_message(BOT_USERNAME, "/start")
+            state["relay_ready"] = True
+        except Exception as e:
+            log(f"relay start failed: {type(e).__name__}")
+    await resolve_channel_ids()
     register_bot_handlers()
 
-    @user.on(events.NewMessage(chats=CHANNEL))
+    @user.on(events.NewMessage(incoming=True))
     async def on_post(ev):
-        if parse_post(ev.message) and str(ev.message.id) not in state["items"]:
-            state["last_msg_id"] = max(int(state.get("last_msg_id") or 0), ev.message.id)
-            mark()
-            if state.get("enabled"):
-                enqueue(ev.message.id)
+        key = chan_ids.get(ev.chat_id)
+        if not key or not parse_post(ev.message):
+            return
+        ref = ref_of(key, ev.message.id)
+        last_ids = state.setdefault("last_ids", {})
+        last_ids[key] = max(int(last_ids.get(key) or 0), ev.message.id)
+        mark()
+        if ref not in state["items"] and state.get("enabled"):
+            enqueue(ref)
 
     ping = await sib({"action": "ping"}, tries=2)
     state["server"] = {"ok": bool(ping.get("ok")), "allowPublish": ping.get("allowPublish"), "t": now_iso()}
     log(f"sibstar ping ok={ping.get('ok')}")
     for p in state.pop("pending", []) or []:
-        mid = p.pop("id", None)
+        ref = p.pop("ref", None) or (ref_of(DEFAULT_CHANNEL, p.pop("id")) if p.get("id") else None)
+        p.pop("id", None)
+        p.pop("batch", None)
+        p.pop("test_publish", None)
         if not PUBLISH_UNLOCKED:
             p.pop("mode", None)
-        if mid:
-            enqueue(int(mid), **p)
+        if ref:
+            enqueue(ref, **p)
     await catch_up()
-    if TEST_MESSAGE_ID:
-        enqueue(TEST_MESSAGE_ID, manual=True, force=True, mode="draft")
+    for r in TEST_REFS:
+        enqueue(r, manual=True, force=True, mode=TEST_MODE, test_publish=(TEST_MODE == "publish"))
     save_state()
-    tasks = [asyncio.create_task(worker()), asyncio.create_task(state_saver())]
+    tasks = [asyncio.create_task(worker()), asyncio.create_task(state_saver()), asyncio.create_task(cleanup_sweeper())]
     if not ping.get("ok"):
         await notify("⚠️ ربات بالا آمد ولی به سایت وصل نشد: " + esc(ping.get("reasonFa")))
-    if not state.get("hello_sent"):
-        ok = await notify("🟢 ربات آپدیت خودکار سیب‌استار راه افتاد.\nحالت: فقط پیش‌نویس، چیزی منتشر نمی‌شود.\n/start را بزن تا منو بیاید.", buttons=menu_buttons())
-        state["hello_sent"] = bool(ok)
+    if not state.get("hello_v2"):
+        ok = await notify("🆕 امکانات تازه: چک آپدیت‌های امروز / یک روز، مدیریت چند کانال، و ارسال مستقیم فایل IPA به همین ربات.\n/start را بزن.", buttons=menu_buttons())
+        state["hello_v2"] = bool(ok)
+        state["hello_sent"] = True
         mark()
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -710,15 +1095,13 @@ async def main():
         await asyncio.wait_for(stop.wait(), timeout=RUN_SECONDS)
     except asyncio.TimeoutError:
         pass
-    # finish the current item if one is running (max 20 min), then exit
     t0 = time.time()
-    while current["msg_id"] and time.time() - t0 < 1200:
+    while current["ref"] and time.time() - t0 < 1200:
         await asyncio.sleep(5)
-    # leave unprocessed queue items for the next run
     pend = []
     while not queue.empty():
-        mid, opts = queue.get_nowait()
-        pend.append({"id": mid, **opts})
+        ref, opts = queue.get_nowait()
+        pend.append({"ref": ref, **{k: v for k, v in opts.items() if k not in ("batch", "test_publish")}})
     state["pending"] = pend
     for t in tasks:
         t.cancel()

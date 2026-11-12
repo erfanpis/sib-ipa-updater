@@ -10,10 +10,14 @@ on:
     - cron: "37 * * * *"
   workflow_dispatch:
     inputs:
-      test_message_id:
-        description: "Process this @blatants message id once in DRAFT mode (test)"
+      test_refs:
+        description: "One-off test: comma list like blatants/13480 (bare ids = @blatants)"
         required: false
         default: ""
+      test_mode:
+        description: "draft (default) or publish (explicit approval, test items only)"
+        required: false
+        default: "draft"
 
 permissions:
   contents: write
@@ -61,7 +65,9 @@ jobs:
           ADMIN_ID: ${{ secrets.ADMIN_ID }}
           SIBSTAR_ENDPOINT: ${{ secrets.SIBSTAR_ENDPOINT }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
-          TEST_MESSAGE_ID: ${{ github.event.inputs.test_message_id }}
+          TEST_REFS: ${{ github.event.inputs.test_refs }}
+          TEST_MODE: ${{ github.event.inputs.test_mode }}
+          PUBLISH_UNLOCKED: ${{ vars.PUBLISH_UNLOCKED }}
           STATE_DIR: state
           PYTHONUNBUFFERED: "1"
         run: |
