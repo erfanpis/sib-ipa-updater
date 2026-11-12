@@ -540,6 +540,7 @@ async def process(ref, opts):
         it = {**post, "status": "queued", "created": now_iso(), "attempts": 0}
         state["items"][ref] = it
     it.update({k: post[k] for k in ("name", "bundle", "version", "file", "size", "ref", "chan", "msg_id")})
+    it["plist"] = post.get("plist")
     it["attempts"] = it.get("attempts", 0) + 1
     it["updated"] = now_iso()
     mode = opts.get("mode") or state.get("mode", "draft")
