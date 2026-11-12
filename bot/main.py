@@ -44,9 +44,10 @@ RUN_SECONDS = int(os.environ.get("RUN_SECONDS", str(5 * 3600 - 15 * 60)))
 STATE_DIR = os.environ.get("STATE_DIR", "state")
 STATE_PUSH = os.environ.get("STATE_PUSH", "1") == "1"
 STATE_KEY = os.environ.get("STATE_KEY", "")  # state is pushed ONLY encrypted (public repo)
-# Publishing is LOCKED unless the repo variable PUBLISH_UNLOCKED=1 is set (Erfan's explicit approval).
-PUBLISH_UNLOCKED = os.environ.get("PUBLISH_UNLOCKED", "0") == "1"
-FINAL_STATUSES = ("draft_ok", "published", "skipped", "rejected", "duplicate")
+# v3: the admin's mode button is the control; the server's SIBSTAR_AUTO_IPA_ALLOW_PUBLISH is the master kill switch.
+FINAL_STATUSES = ("draft_ok", "published", "skipped", "rejected", "duplicate", "discarded")
+SITE = os.environ.get("SITE_URL", "https://beta.sibstars.ir").rstrip("/")
+TEST_ACTIONS = [a.strip() for a in os.environ.get("TEST_ACTIONS", "").split(",") if ":" in a]
 # one-off test run (workflow_dispatch inputs): refs like "blatants/13480"; TEST_MODE=publish is explicit approval
 TEST_REFS = [r.strip() if "/" in r else f"{DEFAULT_CHANNEL}/{r.strip()}" for r in os.environ.get("TEST_REFS", os.environ.get("TEST_MESSAGE_ID", "")).split(",") if r.strip() and r.strip() != "0"]
 TEST_MODE = "publish" if os.environ.get("TEST_MODE") == "publish" else "draft"
@@ -102,9 +103,11 @@ def load_state():
         it = state["items"].pop(k)
         it.update(ref=f"{DEFAULT_CHANNEL}/{k}", chan=DEFAULT_CHANNEL)
         state["items"][f"{DEFAULT_CHANNEL}/{k}"] = it
-    if not PUBLISH_UNLOCKED and state.get("mode") != "draft":
+    # v3 migration: start in draft/manual once; afterwards only the admin's button changes the mode
+    if not state.get("v3"):
+        state["v3"] = True
         state["mode"] = "draft"
-        event("mode forced to draft (publish locked)")
+        event("v3: mode reset to draft (manual)")
 
 
 def mark():
@@ -126,7 +129,8 @@ def save_state(push=True):
     os.makedirs(STATE_DIR, exist_ok=True)
     items = state["items"]
     if len(items) > 400:
-        for k in sorted(items, key=lambda x: (items[x].get("updated") or ""))[:-400]:
+        old = [k for k in sorted(items, key=lambda x: (items[x].get("updated") or "")) if items[k].get("status") != "draft_ok"]
+        for k in old[: len(items) - 400]:
             items.pop(k, None)
     tmp = STATE_FILE + ".tmp"
     with open(tmp, "w", encoding="utf8") as f:
@@ -318,16 +322,35 @@ def item_title(it):
     return esc(app.get("nameFa") or app.get("name") or it.get("name"))
 
 
+def sid_of(ref):
+    return hashlib.sha256(ref.encode()).hexdigest()[:10]
+
+
+def ref_by_sid(sid):
+    for k in state["items"]:
+        if sid_of(k) == sid:
+            return k
+    return None
+
+
 def item_buttons(it):
-    mid = it.get("ref") or f"{DEFAULT_CHANNEL}/{it.get('msg_id')}"
+    ref = it.get("ref") or f"{DEFAULT_CHANNEL}/{it.get('msg_id')}"
+    sid = sid_of(ref)
     st = it.get("status")
     if st in ("failed", "rejected", "error"):
-        return [[Button.inline("🔁 تلاش دوباره", f"retry:{mid}".encode())]]
+        return [[Button.inline("🔁 تلاش دوباره", f"rt:{sid}".encode())]]
     if st == "skipped" and it.get("code") in ("same_version", "older_version"):
-        return [[Button.inline("🔁 بازهم آپدیت کن", f"force:{mid}".encode())]]
-    if st == "draft_ok" and PUBLISH_UNLOCKED:
-        return [[Button.inline("🚀 انتشار همین", f"pub:{mid}".encode())]]
+        return [[Button.inline("🔁 بازهم آپدیت کن", f"fc:{sid}".encode())]]
+    if st == "draft_ok":
+        return [[Button.inline("✅ انتشار", f"dp:{sid}".encode()), Button.inline("❌ رد", f"dr:{sid}".encode())]]
+    if st == "duplicate":
+        return [[Button.inline("🔁 دوباره بررسی", f"re:{sid}".encode())]]
     return None
+
+
+def app_link(it):
+    slug = (it.get("app") or {}).get("slug")
+    return f"\n🔗 {SITE}/app/{esc(slug)}" if slug else ""
 
 
 def fmt_fields(f):
@@ -353,7 +376,13 @@ def item_report(it):
     t = item_title(it)
     if st == "published":
         old = it.get("old_file") or {}
-        return f"✅ <b>{t}</b> آپدیت شد (نسخه {esc((it.get('fields') or {}).get('version'))})\n{fmt_fields(it.get('fields'))}\n🗑 {esc(old.get('reasonFa', ''))}"
+        gone = "بله ✅" if old.get("deleted") else "نه"
+        return (f"✅ <b>{t}</b> منتشر شد (نسخه {esc((it.get('fields') or {}).get('version'))})\n{fmt_fields(it.get('fields'))}\n"
+                f"🗑 فایل قبلی حذف شد: {gone} — {esc(old.get('reasonFa', ''))}" + app_link(it))
+    if st == "duplicate":
+        return f"♻️ <b>{t}</b> {esc(it.get('version') or '')}: {esc(it.get('reason'))}"
+    if st == "discarded":
+        return f"🗑 <b>{t}</b> {esc(it.get('version') or '')}: پیش‌نویس رد شد (سایت تغییری نکرد)\n{esc((it.get('discard') or {}).get('reasonFa', ''))}"
     if st == "draft_ok":
         fr = (it.get("plan") or {}).get("from") or {}
         same = " (همان فایل فعلی)" if (it.get("plan") or {}).get("sameFile") else ""
@@ -361,7 +390,7 @@ def item_report(it):
             f"📝 <b>{t}</b> آماده است — فقط پیش‌نویس، منتشر نشد{same}\n"
             f"سایت: نسخه {esc(fr.get('version'))} ← فایل جدید: {fmt_fields((it.get('plan') or {}).get('fields'))}\n"
             f"Bundle ID تأیید شد ✔︎ <code>{esc(((it.get('plan') or {}).get('fields') or {}).get('bundleId'))}</code>"
-            + (f"\nℹ️ {esc(it.get('reason'))}" if it.get("reason") else "")
+            + (f"\nℹ️ {esc(it.get('reason'))}" if it.get("reason") else "") + app_link(it)
         )
     if st == "skipped":
         return f"⚠️ <b>{t}</b>: {esc(it.get('reason'))}"
@@ -544,7 +573,7 @@ async def process(ref, opts):
     it["attempts"] = it.get("attempts", 0) + 1
     it["updated"] = now_iso()
     mode = opts.get("mode") or state.get("mode", "draft")
-    if not (PUBLISH_UNLOCKED or opts.get("test_publish")):
+    if mode != "publish":
         mode = "draft"
     force = bool(opts.get("force"))
     current.update(ref=ref, stage="match")
@@ -582,7 +611,7 @@ async def process(ref, opts):
             return
         if s.get("outcome") != "queued":
             raise RuntimeError(s.get("reasonFa") or "شروع دریافت ناموفق")
-        it.update(job_id=s["jobId"], app=s.get("app"), matched_by=s.get("matchedBy"))
+        it.update(job_id=s["jobId"], app=s.get("app"), matched_by=s.get("matchedBy"), forced=force)
         mark()
         await poll_job(it, url, post, mode)
     except Exception as e:
@@ -612,7 +641,7 @@ async def poll_job(it, url, post, mode):
         deadline = time.time() + 90 * 60
         while time.time() < deadline:
             await asyncio.sleep(15)
-            r = await sib({"action": "status", "jobId": it["job_id"], "appId": it["app"]["id"], "sourceUrl": url, "bundleId": post["bundle"], "mode": mode})
+            r = await sib({"action": "status", "jobId": it["job_id"], "appId": it["app"]["id"], "sourceUrl": url, "bundleId": post["bundle"], "mode": mode, "force": bool(it.get("forced"))})
             oc = r.get("outcome")
             if oc == "pending":
                 current["stage"] = f"import {r.get('progress', 0)}%"
@@ -621,7 +650,7 @@ async def poll_job(it, url, post, mode):
                 it.update(status="draft_ok", plan=r.get("plan"), reason=None, fields=(r.get("plan") or {}).get("fields"))
                 return
             if oc == "published":
-                it.update(status="published", fields=r.get("fields"), old_file=r.get("oldFile"), reason=None)
+                it.update(status="published", fields=r.get("fields"), old_file=r.get("oldFile"), reason=None, published_at=now_iso())
                 return
             if oc == "publish_disabled":
                 it.update(status="draft_ok", plan=r.get("plan"), fields=(r.get("plan") or {}).get("fields"), reason=r.get("reasonFa"))
@@ -659,7 +688,7 @@ def enqueue(ref, **opts):
 
 
 STATUS_FA = {"published": "✅ آپدیت شد", "draft_ok": "📝 پیش‌نویس آماده", "skipped": "⚠️ رد شد", "rejected": "⛔️ رد (بررسی)",
-             "failed": "❌ خطا", "duplicate": "♻️ تکراری", "queued": "⏳ در صف"}
+             "failed": "❌ خطا", "duplicate": "♻️ تکراری", "queued": "⏳ در صف", "discarded": "🗑 پیش‌نویس رد شد"}
 
 
 async def start_batch(label, refs, single=False):
@@ -683,7 +712,12 @@ async def check_batches():
             r = b["refs"][0] if b["refs"] else None
             it = state["items"].get(r) or {}
             if r in b["already"] or it.get("status") == "duplicate":
-                await notify(f"☑️ {item_title(it)} {esc(it.get('version') or '')}: قبلاً بررسی شده/تکراری — {esc(it.get('reason') or STATUS_FA.get(it.get('status'), ''))}")
+                # point at the existing draft (with its buttons) or offer a forced re-check
+                orig = state["items"].get((it.get("reason") or "").split(": ")[-1].rstrip(")")) if it.get("status") == "duplicate" else None
+                btns = item_buttons(orig) if orig and orig.get("status") == "draft_ok" else []
+                btns = (btns or []) + [[Button.inline("🔁 دوباره بررسی", f"re:{sid_of(r)}".encode())]] if r else btns
+                extra = "\n📝 پیش‌نویسش آماده است؛ همین‌جا منتشر یا رد کن:" if btns and len(btns) > 1 else ""
+                await notify(f"☑️ {item_title(it)} {esc(it.get('version') or '')}: قبلاً بررسی شده/تکراری — {esc(it.get('reason') or STATUS_FA.get(it.get('status'), ''))}{extra}", buttons=btns or None)
             continue
         lines = [f"<b>{esc(b['label'])}</b>", f"پیدا شد: {len(b['refs'])} فایل IPA"]
         groups = {}
@@ -866,9 +900,11 @@ async def cleanup_sweeper():
     """publish mode only: hourly strict cleanup of previous files / superseded draft imports (server re-checks)."""
     while True:
         await asyncio.sleep(3600)
-        if not (PUBLISH_UNLOCKED and state.get("enabled") and state.get("mode") == "publish"):
-            continue
+        if not state.get("enabled"):
+            continue  # the server only deletes when SIBSTAR_AUTO_IPA_ALLOW_PUBLISH=1 (else dry-run)
         try:
+            ping = await sib({"action": "ping"}, tries=2)
+            state["server"] = {"ok": bool(ping.get("ok")), "allowPublish": ping.get("allowPublish"), "t": now_iso()}
             r = await sib({"action": "cleanup", "dryRun": False, "limit": 20})
             done = [x for x in r.get("results", []) if x.get("deleted")]
             if done:
@@ -879,13 +915,152 @@ async def cleanup_sweeper():
             log(f"cleanup failed: {type(e).__name__}")
 
 
+# ---------------------------------------------------------------- drafts (v3)
+busy = set()  # refs with a publish/discard in flight (double-tap guard)
+PAGE = 5
+
+
+def drafts():
+    return sorted((v for v in state["items"].values() if v.get("status") == "draft_ok"), key=lambda v: v.get("updated") or "", reverse=True)
+
+
+def source_fa(it):
+    ch = it.get("chan") or ""
+    return "فوروارد/ارسال مستقیم" if ch == "dm" else f"@{esc(ch)}"
+
+
+def draft_line(i, it):
+    plan = it.get("plan") or {}
+    fr = (plan.get("from") or {}).get("version") or "?"
+    f = plan.get("fields") or it.get("fields") or {}
+    to = f.get("version") or it.get("version") or "?"
+    sz = f.get("sizeBytes") or it.get("size") or 0
+    slug = (it.get("app") or {}).get("slug")
+    link = f'\n   🔗 <a href="{SITE}/app/{esc(slug)}">صفحهٔ برنامه</a>' if slug else ""
+    note = f"\n   ℹ️ {esc((it.get('reason') or '')[:90])}" if it.get("reason") else ""
+    return (f"<b>{i}. {item_title(it)}</b>\n   {esc(fr)} ← <b>{esc(to)}</b> · {sz / 1048576:.1f} MB\n"
+            f"   منبع: {source_fa(it)} · {fa_time(it.get('created') or it.get('updated'))}{link}{note}")
+
+
+def drafts_view(page=0):
+    ds = drafts()
+    if not ds:
+        return "📝 پیش‌نویسی در انتظار نیست.", [[Button.inline("🏠 منو", b"status")]]
+    pages = (len(ds) + PAGE - 1) // PAGE
+    page = max(0, min(page, pages - 1))
+    chunk = ds[page * PAGE:(page + 1) * PAGE]
+    lines = [f"<b>📝 پیش‌نویس‌ها ({len(ds)})</b> — صفحه {page + 1}/{pages}", "سایت تا وقتی «انتشار» نزنی تغییری نمی‌کند.\n"]
+    rows = []
+    for n, it in enumerate(chunk, start=page * PAGE + 1):
+        lines.append(draft_line(n, it))
+        sid = sid_of(it["ref"])
+        rows.append([Button.inline(f"✅ انتشار {n}", f"dp:{sid}".encode()), Button.inline(f"❌ رد {n}", f"dr:{sid}".encode())])
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("« قبلی", f"dl:{page - 1}".encode()))
+    if page < pages - 1:
+        nav.append(Button.inline("بعدی »", f"dl:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline(f"🚀 انتشار همه ({len(ds)})", b"dpall"), Button.inline("🔄 تازه‌سازی", f"dl:{page}".encode())])
+    rows.append([Button.inline("🏠 منو", b"status")])
+    return "\n".join(lines)[:4000], rows
+
+
+async def publish_draft(ref, quiet=False):
+    """Explicit admin action: publish one existing draft now (any mode). Idempotent (busy set + server sameFile check)."""
+    it = state["items"].get(ref)
+    if not it:
+        return "پیدا نشد"
+    if it.get("status") == "published":
+        return "already"
+    if it.get("status") != "draft_ok":
+        return "not_draft"
+    if ref in busy or ref in inflight:
+        return "busy"
+    if not (it.get("job_id") and (it.get("app") or {}).get("id")):
+        return "no_job"
+    busy.add(ref)
+    try:
+        r = await sib({"action": "status", "jobId": it["job_id"], "appId": it["app"]["id"], "sourceUrl": it.get("url") or "",
+                       "bundleId": it.get("bundle"), "mode": "publish", "force": bool(it.get("forced"))})
+        oc = r.get("outcome")
+        if oc == "published":
+            it.update(status="published", fields=r.get("fields"), old_file=r.get("oldFile"), reason=None, published_at=now_iso(), mode="manual")
+        elif oc in ("skipped", "rejected"):
+            it.update(status="skipped" if oc == "skipped" else "rejected", code=r.get("code"), reason=r.get("reasonFa"))
+        elif oc == "failed":
+            it.update(status="failed", reason="فایل پیش‌نویس روی سرور نیست: " + str(r.get("reasonFa") or ""))
+        elif oc == "publish_disabled":
+            it["reason"] = "انتشار روی سرور با کلید اضطراری خاموش است"
+        else:
+            it["reason"] = r.get("reasonFa") or f"پاسخ نامعتبر ({oc})"
+        it["updated"] = now_iso()
+        event(f"{ref} manual publish -> {it.get('status')}")
+        it["reported"] = hashlib.sha256(item_report(it).encode()).hexdigest()[:16]
+        save_state()
+        if not quiet:
+            msg = item_report(it) if it["status"] != "draft_ok" else f"⚠️ <b>{item_title(it)}</b> منتشر نشد: {esc(it.get('reason'))}"
+            if r.get("alreadyPublished"):
+                msg = f"☑️ <b>{item_title(it)}</b> قبلاً منتشر شده بود؛ دوباره کاری انجام نشد." + app_link(it)
+            await notify(msg, buttons=item_buttons(it))
+        return it["status"]
+    finally:
+        busy.discard(ref)
+
+
+async def discard_draft(ref):
+    it = state["items"].get(ref)
+    if not it or it.get("status") != "draft_ok":
+        return "not_draft"
+    if ref in busy or ref in inflight:
+        return "busy"
+    busy.add(ref)
+    try:
+        r = {"outcome": "discarded", "file": {"deleted": False, "reasonFa": "فایلی روی سرور ثبت نشده بود"}}
+        if it.get("job_id") and (it.get("app") or {}).get("id"):
+            r = await sib({"action": "discard", "jobId": it["job_id"], "appId": it["app"]["id"]})
+        oc = r.get("outcome")
+        if oc == "discarded":
+            it.update(status="discarded", discard=r.get("file") or {}, updated=now_iso(), reason=None)
+        elif oc == "already_published":
+            it.update(status="published", reason=r.get("reasonFa"), updated=now_iso())
+        else:
+            await notify(f"⚠️ رد <b>{item_title(it)}</b> انجام نشد: {esc(r.get('reasonFa'))}")
+            return "error"
+        event(f"{ref} discarded by admin")
+        save_state()
+        await notify(item_report(it))
+        return it["status"]
+    finally:
+        busy.discard(ref)
+
+
+async def publish_all():
+    refs = [d["ref"] for d in drafts()]
+    res = {}
+    for ref in refs:
+        st = await publish_draft(ref, quiet=True)
+        res.setdefault(st, []).append(state["items"].get(ref) or {})
+    lab = {"published": "✅ منتشر شد", "skipped": "⚠️ منتشر نشد", "rejected": "⛔️ رد (بررسی)", "failed": "❌ خطا", "draft_ok": "📝 هنوز پیش‌نویس", "busy": "⏳ در حال کار"}
+    lines = [f"<b>🚀 انتشار همه — {len(refs)} پیش‌نویس</b>"]
+    for st, its in res.items():
+        lines.append(f"\n{lab.get(st, st)}: {len(its)}")
+        for it in its[:20]:
+            old = it.get("old_file") or {}
+            extra = (" — فایل قبلی حذف شد ✅" if old.get("deleted") else f" — فایل قبلی ماند: {esc((old.get('reasonFa') or '')[:60])}") if st == "published" else f" — {esc((it.get('reason') or '')[:70])}"
+            lines.append(f"• {item_title(it)} {esc((it.get('fields') or {}).get('version') or it.get('version') or '')}{extra}")
+    await notify("\n".join(lines)[:3900])
+
+
 # ---------------------------------------------------------------- admin bot UI
 def menu_buttons():
     on = state.get("enabled")
     draft = state.get("mode", "draft") == "draft"
     return [
         [Button.inline("🔴 خاموش کن" if on else "🟢 روشن کن", b"toggle"), Button.inline("📊 وضعیت", b"status")],
-        [Button.inline("📝 حالت: فقط پیش‌نویس، منتشر نکن" if draft else "🚀 حالت: انتشار خودکار", b"mode")],
+        [Button.inline(f"📝 پیش‌نویس‌ها ({len(drafts())})", b"dl:0")],
+        [Button.inline("📝 حالت: پیش‌نویس (دستی منتشر می‌کنم)" if draft else "🚀 حالت: انتشار خودکار", b"mode")],
         [Button.inline("🔎 چک آپدیت‌های امروز", b"scan_today"), Button.inline("📆 چک آپدیت‌های یک روز", b"scan_day")],
         [Button.inline("📡 کانال‌ها", b"channels"), Button.inline("🕘 آخرین کارها", b"recent")],
         [Button.inline("📅 گزارش امروز", b"today"), Button.inline("🔁 تلاش دوباره خطاها", b"retryall")],
@@ -894,12 +1069,12 @@ def menu_buttons():
 
 def status_text():
     on = "روشن 🟢" if state.get("enabled") else "خاموش 🔴"
-    mode = "فقط پیش‌نویس 📝" if state.get("mode", "draft") == "draft" else "انتشار خودکار 🚀"
-    if not PUBLISH_UNLOCKED:
-        mode += " (انتشار قفل است 🔒)"
+    mode = "پیش‌نویس (دستی منتشر می‌کنم) 📝" if state.get("mode", "draft") == "draft" else "انتشار خودکار 🚀"
+    if (state.get("server") or {}).get("allowPublish") is False:
+        mode += "\n⛔️ کلید اضطراری سرور: انتشار خاموش است"
     cur = f"\n⏳ در حال کار: {esc((state['items'].get(current['ref'] or '') or {}).get('name'))} ({esc(current['stage'])})" if current["ref"] else ""
     chs = "، ".join(esc(c["key"]) for c in state.get("channels", [])) or "—"
-    return f"<b>آپدیت خودکار سیب‌استار</b>\nوضعیت: {on}\nحالت: {mode}\nصف: {queue.qsize()}\nکانال‌ها: {chs}{cur}\n\nمی‌توانی فایل IPA را مستقیم بفرستی یا فوروارد کنی."
+    return f"<b>آپدیت خودکار سیب‌استار</b>\nوضعیت: {on}\nحالت: {mode}\nپیش‌نویس‌های منتظر: {len(drafts())}\nصف: {queue.qsize()}\nکانال‌ها: {chs}{cur}\n\nمی‌توانی فایل IPA را مستقیم بفرستی یا فوروارد کنی."
 
 
 def today_text():
@@ -1004,26 +1179,83 @@ def register_bot_handlers():
             event(f"enabled={state['enabled']}")
             await ev.answer("روشن شد" if state["enabled"] else "خاموش شد")
             await ev.edit(status_text(), buttons=menu_buttons(), parse_mode="html")
-        elif d in ("mode", "mode_pub") and not PUBLISH_UNLOCKED:
-            state["mode"] = "draft"
-            await ev.answer("انتشار خودکار قفل است؛ فقط پیش‌نویس.", alert=True)
         elif d == "mode":
             if state.get("mode", "draft") == "draft":
                 await ev.answer()
                 await ev.respond(
-                    "⚠️ با «انتشار خودکار» هر آپدیت بدون بررسی روی سایت منتشر می‌شود. مطمئنی؟",
+                    "⚠️ با «انتشار خودکار» هر آپدیت تأییدشده (همان برنامه، Bundle ID درست، نسخهٔ جدیدتر) بدون بررسی تو روی سایت منتشر می‌شود و فایل قبلی با همان کنترل‌ها پاک می‌شود. مطمئنی؟",
                     buttons=[[Button.inline("بله، انتشار خودکار", b"mode_pub"), Button.inline("نه", b"noop")]],
                 )
             else:
                 state["mode"] = "draft"
                 event("mode=draft")
-                await ev.answer("حالت فقط پیش‌نویس")
+                await ev.answer("حالت پیش‌نویس (دستی)")
                 await ev.edit(status_text(), buttons=menu_buttons(), parse_mode="html")
         elif d == "mode_pub":
             state["mode"] = "publish"
             event("mode=publish")
+            save_state()
             await ev.answer("انتشار خودکار روشن شد")
-            await ev.edit("🚀 انتشار خودکار روشن شد.\n" + status_text(), buttons=menu_buttons(), parse_mode="html")
+            warn = "\n⛔️ ولی کلید اضطراری سرور خاموش است؛ تا روشن نشود فقط پیش‌نویس ساخته می‌شود." if (state.get("server") or {}).get("allowPublish") is False else ""
+            await ev.edit("🚀 انتشار خودکار روشن شد." + warn + "\n" + status_text(), buttons=menu_buttons(), parse_mode="html")
+        elif d.startswith("dl:"):
+            await ev.answer()
+            text, rows = drafts_view(int(d[3:] or 0))
+            try:
+                await ev.edit(text, buttons=rows, parse_mode="html", link_preview=False)
+            except Exception:
+                await ev.respond(text, buttons=rows, parse_mode="html", link_preview=False)
+        elif d == "dpall":
+            n = len(drafts())
+            await ev.answer()
+            if not n:
+                await ev.respond("پیش‌نویسی در انتظار نیست.")
+            else:
+                await ev.respond(f"⚠️ همهٔ {n} پیش‌نویس الان روی سایت منتشر شوند؟ (هر کدام با همان کنترل‌ها؛ فایل قبلی هر برنامه فقط اگر امن باشد پاک می‌شود)",
+                                 buttons=[[Button.inline(f"بله، {n} مورد منتشر شود", b"dpall_yes"), Button.inline("نه", b"noop")]])
+        elif d == "dpall_yes":
+            if "publish_all" in busy:
+                await ev.answer("همین الان در حال انتشار است", alert=True)
+            else:
+                busy.add("publish_all")
+                await ev.answer("شروع شد…")
+                await ev.edit("⏳ انتشار همهٔ پیش‌نویس‌ها شروع شد…")
+
+                async def _all():
+                    try:
+                        await publish_all()
+                    finally:
+                        busy.discard("publish_all")
+                asyncio.create_task(_all())
+        elif d[:3] in ("dp:", "dr:", "re:", "rt:", "fc:"):
+            kind, ref = d[:2], ref_by_sid(d[3:])
+            it = state["items"].get(ref or "") or {}
+            if not ref:
+                await ev.answer("این مورد دیگر وجود ندارد", alert=True)
+            elif kind == "dp":
+                if it.get("status") == "published":
+                    await ev.answer("قبلاً منتشر شده ✅", alert=True)
+                elif it.get("status") != "draft_ok":
+                    await ev.answer(f"دیگر پیش‌نویس نیست ({STATUS_FA.get(it.get('status'), it.get('status'))})", alert=True)
+                elif ref in busy or ref in inflight:
+                    await ev.answer("همین الان در حال انجام است…")
+                else:
+                    await ev.answer("در حال انتشار…")
+                    asyncio.create_task(publish_draft(ref))
+            elif kind == "dr":
+                if it.get("status") != "draft_ok":
+                    await ev.answer(f"دیگر پیش‌نویس نیست ({STATUS_FA.get(it.get('status'), it.get('status'))})", alert=True)
+                elif ref in busy or ref in inflight:
+                    await ev.answer("همین الان در حال انجام است…")
+                else:
+                    await ev.answer("رد شد")
+                    asyncio.create_task(discard_draft(ref))
+            elif kind == "re":
+                await ev.answer("دوباره در صف بررسی" if enqueue(ref, manual=True) else "همین الان در صف است")
+            elif kind == "rt":
+                await ev.answer("دوباره در صف" if enqueue(ref, manual=True) else "همین الان در صف است")
+            elif kind == "fc":
+                await ev.answer("دوباره در صف (اجباری)" if enqueue(ref, manual=True, force=True) else "همین الان در صف است")
         elif d == "noop":
             awaiting["kind"] = None
             await ev.answer("لغو شد")
@@ -1075,11 +1307,9 @@ def register_bot_handlers():
                 await ev.answer("دوباره در صف" if enqueue(ref, manual=True) else "همین الان در صف است")
             elif kind == "force":
                 await ev.answer("دوباره در صف (اجباری)" if enqueue(ref, manual=True, force=True) else "همین الان در صف است")
-            elif kind == "pub":
-                if not PUBLISH_UNLOCKED:
-                    await ev.answer("انتشار قفل است؛ فقط پیش‌نویس.", alert=True)
-                else:
-                    await ev.answer("در صف انتشار" if enqueue(ref, manual=True, mode="publish") else "همین الان در صف است")
+            elif kind == "pub":  # old notifications
+                await ev.answer("در حال انتشار…")
+                asyncio.create_task(publish_draft(ref))
             else:
                 await ev.answer()
         mark()
@@ -1168,17 +1398,36 @@ async def main():
         p.pop("id", None)
         p.pop("batch", None)
         p.pop("test_publish", None)
-        if not PUBLISH_UNLOCKED:
-            p.pop("mode", None)
+        p.pop("mode", None)  # the mode is read when the item is processed
         if ref:
             enqueue(ref, **p)
     await catch_up()
     for r in TEST_REFS:
-        enqueue(r, manual=True, force=True, mode=TEST_MODE, test_publish=(TEST_MODE == "publish"))
+        enqueue(r, manual=True, force=True, mode=TEST_MODE)
     save_state()
     tasks = [asyncio.create_task(worker()), asyncio.create_task(state_saver()), asyncio.create_task(cleanup_sweeper())]
     if not ping.get("ok"):
         await notify("⚠️ ربات بالا آمد ولی به سایت وصل نشد: " + esc(ping.get("reasonFa")))
+    async def run_test_actions():
+        for a in TEST_ACTIONS:
+            kind, ref = a.split(":", 1)
+            t0 = time.time()
+            while (ref in inflight or (state["items"].get(ref) or {}).get("status") in (None, "queued")) and time.time() - t0 < 45 * 60:
+                await asyncio.sleep(10)  # a test item queued in the same run must finish first
+            try:
+                st = await (publish_draft(ref) if kind == "publish" else discard_draft(ref) if kind == "discard" else asyncio.sleep(0))
+                log(f"test action {kind} -> {st}")
+            except Exception as e:
+                log(f"test action {kind} failed: {type(e).__name__}")
+    if TEST_ACTIONS:
+        tasks.append(asyncio.create_task(run_test_actions()))
+    if not state.get("hello_v3"):
+        n = len(drafts())
+        ok = await notify(f"🆕 مدیریت پیش‌نویس‌ها اضافه شد: دکمهٔ «📝 پیش‌نویس‌ها ({n})» در منو — هر مورد «✅ انتشار» / «❌ رد»، و «انتشار همه».\n"
+                          "حالت الان: پیش‌نویس (دستی منتشر می‌کنم). با دکمهٔ حالت می‌توانی انتشار خودکار را روشن کنی.", buttons=menu_buttons())
+        state["hello_v3"] = bool(ok)
+        state["hello_v2"] = True
+        mark()
     if not state.get("hello_v2"):
         ok = await notify("🆕 امکانات تازه: چک آپدیت‌های امروز / یک روز، مدیریت چند کانال، و ارسال مستقیم فایل IPA به همین ربات.\n/start را بزن.", buttons=menu_buttons())
         state["hello_v2"] = bool(ok)

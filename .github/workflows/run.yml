@@ -18,6 +18,10 @@ on:
         description: "draft (default) or publish (explicit approval, test items only)"
         required: false
         default: "draft"
+      test_actions:
+        description: "One-off admin actions on existing drafts: publish:<ref>,discard:<ref>"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -67,7 +71,7 @@ jobs:
           STATE_KEY: ${{ secrets.STATE_KEY }}
           TEST_REFS: ${{ github.event.inputs.test_refs }}
           TEST_MODE: ${{ github.event.inputs.test_mode }}
-          PUBLISH_UNLOCKED: ${{ vars.PUBLISH_UNLOCKED }}
+          TEST_ACTIONS: ${{ github.event.inputs.test_actions }}
           STATE_DIR: state
           PYTHONUNBUFFERED: "1"
         run: |

@@ -19,5 +19,7 @@ State lives ENCRYPTED (`state.enc`, AES-256 with secret `STATE_KEY`) on the `sta
 - 🔎 چک آپدیت‌های امروز / 📆 چک آپدیت‌های یک روز (Jalali `۱۴۰۵/۰۸/۲۱` or Gregorian `2026-11-12`): scans every channel for that Tehran day and sends a summary.
 - Send or forward an .ipa file to the admin bot: it is relayed to the user account and goes through the same link → match → import → draft/publish flow.
 - Dedupe: per message ref (`channel/msgid`), per app+version across channels, identical reports are not re-sent.
-- Publishing is locked unless repo variable `PUBLISH_UNLOCKED=1` (and the server allows publishing). A one-off supervised test can be dispatched with inputs `test_refs` + `test_mode=publish`.
+- Drafts (v3): menu button «📝 پیش‌نویس‌ها (N)» lists pending drafts (paginated) with old → new version, size, source, time and the app link; per item «✅ انتشار» (publishes that draft now, in any mode; idempotent) and «❌ رد» (no site change; the staged import is removed only under the strict per-file guards). «انتشار همه» asks for confirmation. Every new draft notification carries the same buttons; duplicate notices carry «🔁 دوباره بررسی».
+- Mode: the admin's button switches «پیش‌نویس (دستی منتشر می‌کنم)» ↔ «انتشار خودکار» (admin-only). The server's `SIBSTAR_AUTO_IPA_ALLOW_PUBLISH` stays the emergency kill switch.
+- One-off tests: dispatch with `test_refs` (+ `test_mode`) and/or `test_actions` like `publish:blatants/13483,discard:blatants/13444`.
 - When publishing, the previous IPA is deleted only after the server's strict per-file check (fix116).
