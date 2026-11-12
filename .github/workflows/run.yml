@@ -55,7 +55,7 @@ jobs:
           R="$GITHUB_REPOSITORY"; ME="${{ github.run_id }}"; deadline=$(( $(date +%s) + 2400 ))
           while :; do
             live=$(gh run list -R "$R" -w run.yml -L 30 --json databaseId,status,createdAt \
-              -q '[.[] | select(.status != "completed")] | sort_by(.createdAt) | .[] | "\(.databaseId) \(.createdAt)"' 2>/dev/null) || { sleep 10; continue; }
+              -q '[.[] | select(.status == "in_progress")] | sort_by(.createdAt) | .[] | "\(.databaseId) \(.createdAt)"' 2>/dev/null) || { sleep 10; continue; }
             pos=$(echo "$live" | awk -v me="$ME" '$1==me{print NR}')
             [ -z "$pos" ] && pos=1
             if [ "$pos" = "1" ]; then echo "go=1" >> "$GITHUB_OUTPUT"; echo "starting bot"; exit 0; fi
