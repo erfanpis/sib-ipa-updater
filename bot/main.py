@@ -1770,7 +1770,8 @@ def register_bot_handlers():
             warn = "\n⛔️ ولی کلید اضطراری سرور خاموش است؛ تا روشن نشود فقط پیش‌نویس ساخته می‌شود." if (state.get("server") or {}).get("allowPublish") is False else ""
             await ev.edit("🚀 انتشار خودکار روشن شد." + warn + "\n" + status_text(), buttons=menu_buttons(), parse_mode="html")
         elif d == "noop_":
-            await ev.answer("⏳ در حال انجام…" if busy or state.get("actions") else "")
+            await ev.answer("⏳ در حال انجام است؛ نتیجه همین‌جا نوشته می‌شود." if busy or state.get("actions")
+                            else "ℹ️ این دکمه فقط وضعیت را نشان می‌دهد؛ کار تمام شده است.")
         elif d.startswith("dl:"):
             await ev.answer()
             state["list_page"] = int(d[3:] or 0)
