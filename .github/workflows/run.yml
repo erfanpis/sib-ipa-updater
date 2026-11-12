@@ -78,7 +78,7 @@ jobs:
           exit "${code:-1}"
 
       - name: Respawn next run
-        if: always()
+        if: always() && vars.NO_RESPAWN != '1'
         env:
           GH_TOKEN: ${{ secrets.RESPAWN_PAT || github.token }}
         run: |
